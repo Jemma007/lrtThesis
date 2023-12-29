@@ -57,41 +57,44 @@ def concat_features(raw_log_path, user_feature_path, video_feature_path):
     raw_df['duration_ms'] = raw_df['duration_ms'] // 100
 
     # 处理tag
-    raw_df['tag'] = raw_df['tag'].apply(lambda x:str(x).split(',')[0])
+    raw_df['tag'] = raw_df['tag'].apply(lambda x: int(str(x).split(',')[0]) if str(x).split(',')[0].isdigit() else -1)
 
     # 处理hate标签
     raw_df['is_not_hate'] = 1 - raw_df['is_hate']
 
+    raw_df['effective_view'] = raw_df['is_click']
+
+    return raw_df
+
+def process_features(full_df):
     # 处理离散变量
     le = dict()
     for fea in category_features:
         le[fea] = LabelEncoder()
-        raw_df[fea] = le[fea].fit_transform(raw_df[fea])
+        full_df[fea] = le[fea].fit_transform(full_df[fea])
 
-    # # 处理连续变量
-    # num_bins = 11
-    # for fea in continuous_features:
-    #     # print(raw_df[fea])
-    #     raw_df[fea + '_bin'] = pd.qcut(raw_df[fea], q=num_bins, labels=False, duplicates='drop')
-    #     n = raw_df[fea + '_bin'].nunique()
-    #     raw_df[fea + '_bin'] = raw_df[fea + '_bin'].map(dict((idx, idx / (n - 1)) for idx in range(n)))
-    #     # print(pd.qcut(raw_df[fea], q=num_bins, labels=False, duplicates='drop', retbins=True))
-    #     # print(raw_df[fea + '_bin'].value_counts())
+    # 处理历史行为序列
+    for fea in history_id_columns:
+        full_df[fea] = le['video_id'].fit_transform(full_df[fea])
+
+    for fea in history_tag_columns:
+        full_df[fea] = le['tag'].fit_transform(full_df[fea])
 
     # 处理连续变量
-    mms = MinMaxScaler(feature_range=(0, 1))
-    raw_df[continuous_features] = mms.fit_transform(raw_df[continuous_features])
-
+    num_bins = 10
+    for fea in continuous_features:
+        # print(raw_df[fea])
+        full_df[fea] = pd.qcut(full_df[fea], q=num_bins, labels=False, duplicates='drop')
     # 处理成字典
-    final_columns = category_features + continuous_features
-    categorical_feature_dict, continuous_feature_dict = {}, {}
+    final_columns = category_features + continuous_features + history_tag_columns + history_id_columns + ['emp_' + label for label in labels]
+    categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict = {}, {}, {}
     for idx, col in tqdm(enumerate(final_columns)):
-        if col in category_features:
-            raw_df[col] = raw_df[col].map(int)
-            categorical_feature_dict[col] = (len(raw_df[col].unique()), idx)
+        if not col.startswith('emp_'):
+            full_df[col] = full_df[col].map(int)
+            categorical_feature_dict[col] = (len(full_df[col].unique()), idx)
         else:
             continuous_feature_dict[col] = (0, idx)
-    return raw_df, categorical_feature_dict, continuous_feature_dict, le
+    return le, categorical_feature_dict, continuous_feature_dict
 
 def add_history_actions(raw_df):
     user_history_id_record = collections.defaultdict(list)
@@ -133,10 +136,11 @@ def add_history_actions(raw_df):
             if raw_df.loc[i, label]:
                 emp_xtr_record[label][user_id].append(item_id)
         # 确定这条样本是否保留，如果小于历史记录最小长度则去掉
+        # print(history_tag, history_id, xtr_list)
         if curr_len >= history_length_min_per_user:
-            history = np.concatenate([history_tag, history_id, xtr_list, [True]])
+            history = np.concatenate([history_tag, history_id, xtr_list, [1]])
         else:
-            history = np.concatenate([history_tag, history_id, xtr_list, [False]])
+            history = np.concatenate([history_tag, history_id, xtr_list, [0]])
         # 使用NumPy数组进行赋值
         # print(history)
         history_data[i] = history
@@ -157,7 +161,7 @@ def add_history_actions(raw_df):
 
 def split_train_test_by_time(df):
     df = df.sort_values('time_ms', ascending=True).reset_index(drop=True)
-    final_columns = category_features + continuous_features + gen_columns + labels
+    final_columns = category_features + continuous_features + history_tag_columns + history_id_columns + ['emp_' + label for label in labels] + labels
     df = df[final_columns]
     # print(df.head())
     train_length = int(df.shape[0]*0.8)
@@ -207,9 +211,9 @@ def get_test_loader(dataset, args):
         dataloader = data_utils.DataLoader(dataset, batch_size=args.test_batch_size, shuffle=False, pin_memory=True)
     return dataloader
 def process_data(args):
-    raw_df, categorical_feature_dict, continuous_feature_dict, le = concat_features(raw_log_path, user_feature_path, video_feature_path)
+    raw_df= concat_features(raw_log_path, user_feature_path, video_feature_path)
     full_df = add_history_actions(raw_df)
-
+    le, categorical_feature_dict, continuous_feature_dict = process_features(full_df)
     train_df, val_df, test_df = split_train_test_by_time(full_df)
     train_dataloader, val_dataloader, test_dataloader = load_data(train_df, val_df, test_df, args)
     return train_dataloader, val_dataloader, test_dataloader, categorical_feature_dict, continuous_feature_dict, user_features, labels, le
