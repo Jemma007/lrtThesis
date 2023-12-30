@@ -130,7 +130,6 @@ class MMOE(nn.Module):
 
 
     def forward(self, x):
-        print(x.size()[1])
         # assert x.size()[1] == len(self.categorical_feature_dict) + len(self.continuous_feature_dict) + len(self.var_cat_feature_dict)*20+1
         # embedding
         cat_embed_list, con_embed_list = list(), list()
