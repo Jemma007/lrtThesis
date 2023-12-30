@@ -49,7 +49,7 @@ if __name__ == "__main__":
     parser.add_argument('--item_min', type=int, default=10)
     parser.add_argument('--save_path', type=str, default='./checkpoint/')
 
-    parser.add_argument('--model_name', default='aud')
+    parser.add_argument('--model_name', default='mmoe')
     parser.add_argument('--embedding_size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=1)
 
@@ -91,12 +91,12 @@ if __name__ == "__main__":
     writer = SummaryWriter()
     data_path = './Data Processing/data/QK_article_1w_final.csv'
 
-    train_dataloader, val_dataloader, test_dataloader, categorical_feature_dict, continuous_feature_dict, user_features, labels, le = process_data(args)
+    train_dataloader, val_dataloader, test_dataloader, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, le = process_data(args)
     if args.model_name == 'aud':
         model = MMOEAUD(categorical_feature_dict, continuous_feature_dict, user_features, labels, writer,
                         emb_dim=args.embedding_size, device=args.device)
     else:
-        model = MMOE(categorical_feature_dict, continuous_feature_dict, labels, writer, emb_dim=args.embedding_size,
+        model = MMOE(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=args.embedding_size,
                      device=args.device)
     # writer.add_graph(model, next(train_dataloader))
     # print(model)
