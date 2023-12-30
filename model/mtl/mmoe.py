@@ -134,12 +134,7 @@ class MMOE(nn.Module):
         # embedding
         cat_embed_list, con_embed_list = list(), list()
         for cat_feature, num in self.categorical_feature_dict.items():
-            if cat_feature.startswith('history_id_'):
-                cat_embed_list.append(self.embedding_dict['video_id'](x[:, num[1]].long()))
-            elif cat_feature.startswith('history_tag_'):
-                cat_embed_list.append(self.embedding_dict['tag'](x[:, num[1]].long()))
-            else:
-                cat_embed_list.append(self.embedding_dict[cat_feature](x[:, num[1]].long()))
+            cat_embed_list.append(self.embedding_dict[cat_feature](x[:, num[1]].long()))
 
         for con_feature, num in self.continuous_feature_dict.items():
             con_embed_list.append(x[:, num[1]].unsqueeze(1))
@@ -218,7 +213,6 @@ class MMOE(nn.Module):
             for idx, (x, y) in tqdm(enumerate(train_loader)):
                 x, y= x.to(device), y.to(device)
                 predict = model(x)
-                # print(predict)
                 for i, l in enumerate(self.labels):
                     y_train_true[l] += list(y[:, i].cpu().numpy())
                     y_train_predict[l] += list(predict[:, i].cpu().detach().numpy())
@@ -251,7 +245,8 @@ class MMOE(nn.Module):
                     y_val_predict[l] += list(predict[:, i].cpu().detach().numpy())
                 val_x = x.cpu().numpy()
                 val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
-                # val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
+                print(val_x[:, 26:31])
+                val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
                 save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
                 loss = sum(
                     [self.loss_function[i](predict[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])

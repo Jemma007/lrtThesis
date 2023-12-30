@@ -20,9 +20,6 @@ category_features = (['user_id', 'weekday', 'hourmin', 'user_active_degree', 'is
                      + [f'onehot_feat{i}' for i in range(18)]
                      + ['video_id', 'author_id', 'upload_type', 'tag'])
 continuous_features = ['duration_ms', 'server_width', 'server_height', 'follow_user_num', 'fans_user_num', 'friend_user_num']
-user_features = (['weekday', 'hourmin', 'user_active_degree', 'is_video_author',
-                     'follow_user_num_range', 'fans_user_num_range', 'friend_user_num_range', 'register_days_range', 'follow_user_num', 'fans_user_num', 'friend_user_num'] +
-                [f'onehot_feat{i}' for i in range(18)])
 labels = ['effective_view', 'is_like', 'long_view', 'is_follow', 'is_comment', 'is_forward', 'is_not_hate']
 history_length_max_per_user = 20
 history_length_min_per_user = 3
@@ -30,6 +27,9 @@ history_id_columns = [f'history_id_{i}' for i in range(1, history_length_max_per
 history_tag_columns = [f'history_tag_{i}' for i in range(1, history_length_max_per_user + 1)]
 emp_list = ['emp_'+label for label in labels]
 gen_columns = history_tag_columns + history_id_columns + emp_list + ['curr_len']
+user_features = (['user_id', 'weekday', 'hourmin', 'user_active_degree', 'is_video_author',
+                     'follow_user_num_range', 'fans_user_num_range', 'friend_user_num_range', 'register_days_range', 'follow_user_num', 'fans_user_num', 'friend_user_num'] +
+                [f'onehot_feat{i}' for i in range(18)]) + history_tag_columns + history_id_columns
 
 class mtlDataSet(data_utils.Dataset):
     def __init__(self, data):
@@ -77,10 +77,10 @@ def process_features(full_df):
 
     # 处理历史行为序列
     for fea in history_id_columns:
-        full_df[fea] = le['video_id'].fit_transform(full_df[fea])
+        full_df[fea] = le['video_id'].transform(full_df[fea])
 
     for fea in history_tag_columns:
-        full_df[fea] = le['tag'].fit_transform(full_df[fea])
+        full_df[fea] = le['tag'].transform(full_df[fea])
 
     # 处理连续变量
     num_bins = 10
@@ -158,13 +158,13 @@ def add_history_actions(raw_df):
 
         user_item_record[user_id].append(item_id)
     raw_df[gen_columns + ['flag']] = history_data
-    full_df = raw_df[raw_df['flag'] == 1].reset_index(drop=True).copy()
-    del raw_df
-    full_df.to_csv(save_path + "full_data.csv", index=False)
-    return full_df
+    raw_df.to_csv(save_path + "full_data.csv", index=False)
+    return raw_df
 
 
-def split_train_test_by_time(df):
+def split_train_test_by_time(full_df):
+    df = full_df[full_df['flag'] == 1].reset_index(drop=True).copy()
+    del full_df
     df = df.sort_values('time_ms', ascending=True).reset_index(drop=True)
     final_columns = category_features + continuous_features + gen_columns + labels
     df = df[final_columns]
