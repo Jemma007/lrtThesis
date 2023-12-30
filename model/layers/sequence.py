@@ -190,6 +190,7 @@ class SequencePoolingLayer(nn.Module):
         row_vector = torch.arange(0, maxlen, 1).to(lengths.device)
         matrix = torch.unsqueeze(lengths, dim=-1)
         mask = row_vector < matrix
+        mask = torch.unsqueeze(mask, dim=1)
 
         mask.type(dtype)
         return mask
@@ -202,8 +203,10 @@ class SequencePoolingLayer(nn.Module):
             mask = mask.unsqueeze(2)
         else:
             uiseq_embed_list, user_behavior_length = seq_value_len_list  # [B, T, E], [B, 1]
+            # print(uiseq_embed_list, user_behavior_length, uiseq_embed_list.shape)
             mask = self._sequence_mask(user_behavior_length, maxlen=uiseq_embed_list.shape[1],
                                        dtype=torch.float32)  # [B, 1, maxlen]
+            # print(mask, mask.shape)
             mask = torch.transpose(mask, 1, 2)  # [B, maxlen, 1]
 
         embedding_size = uiseq_embed_list.shape[-1]
@@ -219,6 +222,8 @@ class SequencePoolingLayer(nn.Module):
 
         if self.mode == 'mean':
             self.eps = self.eps.to(user_behavior_length.device)
+            user_behavior_length = torch.unsqueeze(user_behavior_length, dim=-1)
+            # print(hist, user_behavior_length.shape, hist.shape)
             hist = torch.div(hist, user_behavior_length.type(torch.float32) + self.eps)
 
         hist = torch.unsqueeze(hist, dim=1)

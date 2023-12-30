@@ -7,7 +7,6 @@ Reference:
 '''
 import collections
 import os
-import time
 
 import numpy as np
 import pandas as pd
@@ -16,6 +15,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from tqdm import tqdm
 
+from model.layers.inputs import varlen_embedding_lookup, get_varlen_pooling_list
 from ..layers.core import DNN, PredictionLayer
 from sklearn.metrics import roc_auc_score
 save_data_path = './dataset/data/save/'
@@ -26,7 +26,7 @@ class MMOE(nn.Module):
     MMOE for CTCVR problem
     """
 
-    def __init__(self, categorical_feature_dict, continuous_feature_dict, labels, writer, emb_dim=128,
+    def __init__(self, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=128,
                  num_experts=3, expert_dnn_hidden_units=(256, 128),
                  gate_dnn_hidden_units=(64,), tower_dnn_hidden_units=(64,),
                  l2_reg_embedding=0.00001, l2_reg_dnn=0,
@@ -62,6 +62,7 @@ class MMOE(nn.Module):
         self.tower_dnn_hidden_units = tower_dnn_hidden_units
         self.categorical_feature_dict = categorical_feature_dict
         self.continuous_feature_dict = continuous_feature_dict
+        self.var_cat_feature_dict = var_cat_feature_dict
         self.num_tasks = len(labels)
         self.num_experts = num_experts
         self.writer = writer
@@ -87,7 +88,7 @@ class MMOE(nn.Module):
         self.add_regularization_weight(self.embedding_dict.parameters(), l2=l2_reg_embedding)
 
         # user embedding + item embedding
-        self.input_dim = emb_dim * len(self.categorical_feature_dict) + len(continuous_feature_dict)
+        self.input_dim = emb_dim * (len(self.categorical_feature_dict) + len(self.var_cat_feature_dict)) + len(continuous_feature_dict)
 
         # expert dnn
         self.expert_dnn = nn.ModuleList([DNN(self.input_dim, expert_dnn_hidden_units, activation=dnn_activation,
@@ -129,20 +130,30 @@ class MMOE(nn.Module):
 
 
     def forward(self, x):
-        assert x.size()[1] == len(self.categorical_feature_dict) + len(self.continuous_feature_dict)
+        # assert x.size()[1] == len(self.categorical_feature_dict) + len(self.continuous_feature_dict) + len(self.var_cat_feature_dict)*20+1
         # embedding
         cat_embed_list, con_embed_list = list(), list()
         for cat_feature, num in self.categorical_feature_dict.items():
-            cat_embed_list.append(self.embedding_dict[cat_feature](x[:, num[1]].long()))
+            if cat_feature.startswith('history_id_'):
+                cat_embed_list.append(self.embedding_dict['video_id'](x[:, num[1]].long()))
+            elif cat_feature.startswith('history_tag_'):
+                cat_embed_list.append(self.embedding_dict['tag'](x[:, num[1]].long()))
+            else:
+                cat_embed_list.append(self.embedding_dict[cat_feature](x[:, num[1]].long()))
+
         for con_feature, num in self.continuous_feature_dict.items():
             con_embed_list.append(x[:, num[1]].unsqueeze(1))
+
+        sequence_embed_dict = varlen_embedding_lookup(x, self.embedding_dict, self.var_cat_feature_dict)
+        varlen_embed_list = get_varlen_pooling_list(sequence_embed_dict, x, self.var_cat_feature_dict, self.device)
 
         # embedding 融合
         cat_embed = torch.cat(cat_embed_list, axis=1)
         con_embed = torch.cat(con_embed_list, axis=1)
+        varelen_embed = torch.cat(varlen_embed_list, axis=1)
 
         # hidden layer
-        dnn_input = torch.cat([cat_embed, con_embed], axis=1).float()  # batch * hidden_size
+        dnn_input = torch.cat([cat_embed, con_embed, varelen_embed], axis=1).float()  # batch * hidden_size
         # print(dnn_input)
         # expert dnn
         expert_outs = []
@@ -238,10 +249,10 @@ class MMOE(nn.Module):
                 for i, l in enumerate(self.labels):
                     y_val_true[l] += list(y[:,i].cpu().numpy())
                     y_val_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                train_x = x.cpu().numpy()
-                train_x[:, 0] = le['user_id'].inverse_transform(train_x[:, 0].astype(int))
-                train_x[:, 27] = le['video_id'].inverse_transform(train_x[:, 27].astype(int))
-                save_message.append(np.concatenate([train_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
+                val_x = x.cpu().numpy()
+                val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
+                # val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
+                save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
                 loss = sum(
                     [self.loss_function[i](predict[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
@@ -287,10 +298,10 @@ class MMOE(nn.Module):
             for i, l in enumerate(self.labels):
                 y_test_true[l] += list(y[:, i].cpu().numpy())
                 y_test_predict[l] += list(predict[:, i].cpu().detach().numpy())
-            train_x = x.cpu().numpy()
-            train_x[:, 0] = le['user_id'].inverse_transform(train_x[:, 0].astype(int))
-            train_x[:, 27] = le['video_id'].inverse_transform(train_x[:, 27].astype(int))
-            save_message.append(np.concatenate([train_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
+            test_x = x.cpu().numpy()
+            test_x[:, 0] = le['user_id'].inverse_transform(test_x[:, 0].astype(int))
+            # test_x[:, 27] = le['video_id'].inverse_transform(test_x[:, 27].astype(int))
+            save_message.append(np.concatenate([test_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
             loss = sum(
                 [self.loss_function[i](predict[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
             reg_loss = self.get_regularization_loss()
