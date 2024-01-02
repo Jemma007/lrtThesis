@@ -46,7 +46,7 @@ class MMOEAUX(nn.Module):
         :param expert_activation: activation function like 'relu' or 'sigmoid'
         :param num_task: int default 2 multitask numbers
         """
-        super(MMOEAUD, self).__init__()
+        super(MMOEAUX, self).__init__()
         torch.manual_seed(seed)
         self.regularization_weight = []
         if gpus and str(self.gpus[0]) not in self.device:

@@ -95,7 +95,7 @@ def process_features(full_df):
         categorical_feature_dict[col] = (len(full_df[col].unique()), idx)
 
     for idx, col in enumerate(emp_list):
-        continuous_feature_dict[col] = (0, idx)
+        continuous_feature_dict[col] = (0, len(final_columns) + len(history_tag_columns) + len(history_id_columns) + idx)
     var_cat_feature_dict['history_id'] = (len(final_columns) + 20, len(final_columns) +39, len(final_columns) + len(emp_list) + 40)
     var_cat_feature_dict['history_tag'] = (len(final_columns), len(final_columns) + 19, len(final_columns) + len(emp_list) + 40)
     return le, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict
@@ -107,7 +107,7 @@ def add_history_actions(raw_df):
     user_item_record = collections.defaultdict(list)
     # 使用NumPy数组进行操作
 
-    history_data = np.zeros((raw_df.shape[0], 2 * history_length_max_per_user + len(labels) + 2), dtype=np.int64)
+    history_data = np.zeros((raw_df.shape[0], 2 * history_length_max_per_user + len(labels) + 2), dtype=np.float)
     raw_df = raw_df.sort_values('time_ms', ascending=True).reset_index(drop=True)
     for i in tqdm(range(raw_df.shape[0])):
         user_id = raw_df.loc[i, 'user_id']
@@ -152,13 +152,14 @@ def add_history_actions(raw_df):
             user_history_id_record[user_id].append(item_id)
             user_history_tag_record[user_id].append(tag_id)
             curr_len += 1
-            if curr_len >= history_length_max_per_user:
+            if curr_len > history_length_max_per_user:
                 user_history_id_record[user_id].pop(0)
                 user_history_tag_record[user_id].pop(0)
 
         user_item_record[user_id].append(item_id)
     raw_df[gen_columns + ['flag']] = history_data
-    raw_df.to_csv(save_path + "full_data.csv", index=False)
+    for col in history_tag_columns + history_id_columns:
+        raw_df[col] = raw_df[col].map(int)
     return raw_df
 
 
@@ -217,18 +218,19 @@ def get_test_loader(dataset, args):
     return dataloader
 def process_data(args):
     flag = os.path.exists(save_path + 'full_data.csv')
-    # flag = False
+    flag = False
     if flag:
         full_df = pd.read_csv(save_path + 'full_data.csv')
     else:
         raw_df = concat_features(raw_log_path, user_feature_path, video_feature_path)
         full_df = add_history_actions(raw_df)
+        full_df.to_csv(save_path + "full_data.csv", index=False)
     le, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict = process_features(full_df)
     train_df, val_df, test_df = split_train_test_by_time(full_df)
     # print(train_df.shape)
-    final_columns = category_features + continuous_features + gen_columns + labels
-    full_df = full_df[final_columns]
-    final_columns = category_features + continuous_features
+    # final_columns = category_features + continuous_features + gen_columns + labels
+    # full_df = full_df[final_columns]
+    # final_columns = category_features + continuous_features
     # print(full_df.iloc[:, len(final_columns):len(final_columns) + 20].head())
     # print(full_df.iloc[:, len(final_columns) + len(emp_list) + 40].head())
     train_dataloader, val_dataloader, test_dataloader = load_data(train_df, val_df, test_df, args)

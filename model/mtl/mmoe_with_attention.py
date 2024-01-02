@@ -179,7 +179,7 @@ class MMOEATT(nn.Module):
             task_dnn_outs.append(tower_dnn_out)
         attention_input = torch.stack(task_dnn_outs, dim=1)
         attention_output = self.self_attention(attention_input)
-        task_final_layer_input = torch.split(attention_output + task_dnn_outs, self.num_tasks, dim=1)
+        task_final_layer_input = torch.split(attention_output + attention_input, self.num_tasks, dim=1)
         task_outs = []
         for i in range(self.num_tasks):
             tower_dnn_logit = self.tower_dnn_final_layer[i](task_final_layer_input[i])
