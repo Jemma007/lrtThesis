@@ -37,19 +37,21 @@ class SelfAttentionModule(nn.Module):
 
         return attention_output
 
-# 示例用法
-task_num = 5
-input_dim = 128
 
-# 创建SelfAttentionModule实例
-self_attention_module = SelfAttentionModule(input_dim, task_num)
+if __name__ == '__main__':
+    # 示例用法
+    task_num = 5
+    input_dim = 128
 
-# 生成示例输入
-batch_size = 3
-input_vectors = torch.randn(batch_size, task_num, input_dim)
+    # 创建SelfAttentionModule实例
+    self_attention_module = SelfAttentionModule(input_dim, task_num)
 
-# 调用forward方法进行self-attention计算
-output = self_attention_module(input_vectors)
+    # 生成示例输入
+    batch_size = 3
+    input_vectors = torch.randn(batch_size, task_num, input_dim)
 
-print("Input shape:", input_vectors.shape)
-print("Output shape:", output.shape)
+    # 调用forward方法进行self-attention计算
+    output = self_attention_module(input_vectors)
+
+    print("Input shape:", input_vectors.shape)
+    print("Output shape:", output.shape)

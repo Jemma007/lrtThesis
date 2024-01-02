@@ -218,7 +218,7 @@ def get_test_loader(dataset, args):
     return dataloader
 def process_data(args):
     flag = os.path.exists(save_path + 'full_data.csv')
-    flag = False
+    # flag = False
     if flag:
         full_df = pd.read_csv(save_path + 'full_data.csv')
     else:
