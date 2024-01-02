@@ -245,7 +245,6 @@ class MMOE(nn.Module):
                     y_val_predict[l] += list(predict[:, i].cpu().detach().numpy())
                 val_x = x.cpu().numpy()
                 val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
-                print(val_x[:, 26:31])
                 val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
                 save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
                 loss = sum(

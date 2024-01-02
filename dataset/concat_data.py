@@ -20,7 +20,7 @@ category_features = (['user_id', 'weekday', 'hourmin', 'user_active_degree', 'is
                      + [f'onehot_feat{i}' for i in range(18)]
                      + ['video_id', 'author_id', 'upload_type', 'tag'])
 continuous_features = ['duration_ms', 'server_width', 'server_height', 'follow_user_num', 'fans_user_num', 'friend_user_num']
-labels = ['effective_view', 'is_like', 'long_view', 'is_follow', 'is_comment', 'is_forward', 'is_not_hate']
+labels = ['effective_view', 'is_like', 'long_view', 'is_follow', 'is_comment', 'is_forward']# , 'is_not_hate']
 history_length_max_per_user = 20
 history_length_min_per_user = 3
 history_id_columns = [f'history_id_{i}' for i in range(1, history_length_max_per_user + 1)]

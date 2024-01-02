@@ -22,7 +22,7 @@ from sklearn.metrics import roc_auc_score
 save_data_path = './dataset/data/save/'
 
 
-class MMOEAUD(nn.Module):
+class MMOEAUX(nn.Module):
     """
     MMOE for CTCVR problem
     """
@@ -70,6 +70,7 @@ class MMOEAUD(nn.Module):
         self.writer = writer
         self.labels = labels
         self.task_types = ['binary']*self.num_tasks
+        self.eps = torch.FloatTensor([1e-8]).to(device)
         # TODO
         self.loss_function = [F.binary_cross_entropy]*self.num_tasks
         # print(len(self.categorical_feature_dict), len(self.continuous_feature_dict), len(self.history_feature_dict))
@@ -269,6 +270,7 @@ class MMOEAUD(nn.Module):
         model.train()
         user_avg_weight_in_batch = torch.zeros((self.num_tasks, 1))
         item_avg_weight_in_batch = torch.zeros((self.num_tasks, 1))
+        # save_message = []
         for e in range(epoch):
             y_train_true = collections.defaultdict(list)
             y_train_predict = collections.defaultdict(list)
@@ -283,8 +285,13 @@ class MMOEAUD(nn.Module):
                 else:
                     user_avg_weight_in_batch = user_avg_weight_in_batch*0.9 + 0.1*torch.mean(user_weight, dim=0).detach()
                 user_loss_weight = torch.where(y == 0,
-                                               torch.sigmoid((1-user_avg_weight_in_batch) / (1-user_weight)),
-                                               torch.sigmoid(user_avg_weight_in_batch / user_weight))
+                                               torch.tanh(torch.div((1-user_avg_weight_in_batch), (1-user_weight) + self.eps)),
+                                               torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
+                # # user_id转换
+                # train_x = x.cpu().numpy()
+                # train_x[:, 0] = le['user_id'].inverse_transform(train_x[:, 0].astype(int))
+                # train_x[:, 27] = le['video_id'].inverse_transform(train_x[:, 27].astype(int))
+                # save_message.append(np.concatenate([train_x, y.cpu().numpy(), predict.cpu().detach().numpy(), user_loss_weight.detach().numpy()], axis=1))
                 # item weights处理
                 # if idx == 0:
                 #     item_avg_weight_in_batch = torch.mean(item_weight, dim=0).detach()
@@ -324,7 +331,7 @@ class MMOEAUD(nn.Module):
             count_eval = 0
             y_val_true = collections.defaultdict(list)
             y_val_predict = collections.defaultdict(list)
-            save_message = []
+            # save_message = []
             for idx, (x, y) in enumerate(val_loader):
                 x, y = x.to(device), y.to(device)
                 # predict, user_weight, item_weight = model(x)
@@ -333,9 +340,9 @@ class MMOEAUD(nn.Module):
                     y_val_true[l] += list(y[:,i].cpu().numpy())
                     y_val_predict[l] += list(predict[:, i].cpu().detach().numpy())
                 # user weights处理
-                user_loss_weight = torch.where(y==0,
-                                               torch.sigmoid(((1-user_avg_weight_in_batch) / (1-user_weight)) * -1),
-                                               torch.sigmoid((user_avg_weight_in_batch / user_weight) * -1))
+                user_loss_weight = torch.where(y == 0,
+                                               torch.tanh(torch.div((1-user_avg_weight_in_batch), (1-user_weight) + self.eps)),
+                                               torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
                 # item weights处理
                 # item_loss_weight = torch.where(y==0,
                 #                                torch.sigmoid(((1-item_avg_weight_in_batch) / (1-item_weight)) * -1),
@@ -344,11 +351,11 @@ class MMOEAUD(nn.Module):
                 # 计算weight
                 # loss_weight = torch.mul(item_loss_weight, user_loss_weight)
                 loss_weight = user_loss_weight
-                # user_id转换
-                val_x = x.cpu().numpy()
-                val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
-                val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
-                save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
+                # # user_id转换
+                # val_x = x.cpu().numpy()
+                # val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
+                # val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
+                # save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy(), user_loss_weight.detach().numpy()], axis=1))
                 # loss计算
                 loss = sum(
                     [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none')) for i in range(self.num_tasks)])
@@ -357,9 +364,9 @@ class MMOEAUD(nn.Module):
                 self.writer.add_scalar("val_loss", curr_loss.detach().mean(), idx)
                 total_eval_loss += float(curr_loss)
                 count_eval += 1
-            final_save_message = np.concatenate(save_message, axis=0)
-            val_df = pd.DataFrame(final_save_message)
-            val_df.to_csv(save_data_path+'val_predict_data_mmoeaud.csv', index=False)
+            # final_save_message = np.concatenate(save_message, axis=0)
+            # val_df = pd.DataFrame(final_save_message)
+            # val_df.to_csv(save_data_path+'val_predict_data_mmoeaud.csv', index=False)
             auc = dict()
             for l in self.labels:
                 auc[l] = roc_auc_score(y_val_true[l], y_val_predict[l])
@@ -399,8 +406,9 @@ class MMOEAUD(nn.Module):
                 y_test_predict[l] += list(predict[:, i].cpu().detach().numpy())
             # user weights处理
             user_loss_weight = torch.where(y == 0,
-                                           torch.sigmoid(((1 - user_avg_weight_in_batch) / (1 - user_weight)) * -1),
-                                           torch.sigmoid((user_avg_weight_in_batch / user_weight) * -1))
+                                           torch.tanh(
+                                               torch.div((1 - user_avg_weight_in_batch), (1 - user_weight) + self.eps)),
+                                           torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
             # item weights处理
             # item_loss_weight = torch.where(y == 0,
             #                                torch.sigmoid(((1 - item_avg_weight_in_batch) / (1 - item_weight)) * -1),
@@ -412,7 +420,7 @@ class MMOEAUD(nn.Module):
             test_x = x.cpu().numpy()
             test_x[:, 0] = le['user_id'].inverse_transform(test_x[:, 0].astype(int))
             test_x[:, 27] = le['video_id'].inverse_transform(test_x[:, 27].astype(int))
-            save_message.append(np.concatenate([test_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
+            save_message.append(np.concatenate([test_x, y.cpu().numpy(), predict.cpu().detach().numpy(), user_loss_weight.detach().numpy()], axis=1))
             # loss计算
             loss = sum(
                 [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none')) for
