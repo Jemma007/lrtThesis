@@ -163,7 +163,7 @@ def add_history_actions(raw_df):
     return raw_df
 
 
-def split_train_test_by_time(full_df):
+def split_train_test_by_time(full_df, save=False):
     df = full_df[full_df['flag'] == 1].reset_index(drop=True).copy()
     del full_df
     df = df.sort_values('time_ms', ascending=True).reset_index(drop=True)
@@ -175,9 +175,10 @@ def split_train_test_by_time(full_df):
     train_df = df[:train_length]
     val_df = df[train_length:train_length + val_length]
     test_df = df[train_length + val_length:]
-    train_df.to_csv(save_path + 'train_data.csv', index=False)
-    val_df.to_csv(save_path + 'val_data.csv', index=False)
-    train_df.to_csv(save_path + 'test_data.csv', index=False)
+    if save:
+        train_df.to_csv(save_path + 'train_data.csv', index=False)
+        val_df.to_csv(save_path + 'val_data.csv', index=False)
+        train_df.to_csv(save_path + 'test_data.csv', index=False)
     del df
     # print(train_df.head())
     return train_df, val_df, test_df

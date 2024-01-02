@@ -432,7 +432,7 @@ class MMOEAUX(nn.Module):
             count_eval += 1
         final_save_message = np.concatenate(save_message, axis=0)
         test_df = pd.DataFrame(final_save_message)
-        test_df.to_csv(save_data_path + 'test_predict_data_mmoeaud.csv', index=False)
+        test_df.to_csv(save_data_path + 'test_predict_data_mmoeaux.csv', index=False)
         auc = dict()
         for l in self.labels:
             auc[l] = roc_auc_score(y_test_true[l], y_test_predict[l])
