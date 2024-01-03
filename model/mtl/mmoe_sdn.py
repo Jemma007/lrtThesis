@@ -17,7 +17,6 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from model.layers.inputs import varlen_embedding_lookup, get_varlen_pooling_list
-from ..layers.attention import SelfAttentionModule
 from ..layers.core import DNN, PredictionLayer
 from sklearn.metrics import roc_auc_score
 save_data_path = './dataset/data/save/'
@@ -122,9 +121,6 @@ class MMOEAUX(nn.Module):
             self.add_regularization_weight(
                 filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.tower_dnn.named_parameters()),
                 l2=l2_reg_dnn)
-
-        # 直接默认塔网络有多层
-        self.self_attention = SelfAttentionModule(tower_dnn_hidden_units[-1], self.num_tasks)
         self.tower_dnn_final_layer = nn.ModuleList([nn.Linear(
             tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
             bias=False) for _ in range(self.num_tasks)])
