@@ -121,8 +121,7 @@ class MMOEATT(nn.Module):
         self.self_attention = SelfAttentionModule(tower_dnn_hidden_units[-1], self.num_tasks)
         self.tower_dnn_final_layer = nn.ModuleList([nn.Linear(
             tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
-            bias=False)
-                                                    for _ in range(self.num_tasks)])
+            bias=False)for _ in range(self.num_tasks)])
 
         self.out = nn.ModuleList([PredictionLayer(task) for task in self.task_types])
 
@@ -179,10 +178,10 @@ class MMOEATT(nn.Module):
             task_dnn_outs.append(tower_dnn_out)
         attention_input = torch.stack(task_dnn_outs, dim=1)
         attention_output = self.self_attention(attention_input)
-        task_final_layer_input = torch.split(attention_output + attention_input, self.num_tasks, dim=1)
+        task_final_layer_input = torch.split(attention_output + attention_input, 1, dim=1)
         task_outs = []
         for i in range(self.num_tasks):
-            tower_dnn_logit = self.tower_dnn_final_layer[i](task_final_layer_input[i])
+            tower_dnn_logit = self.tower_dnn_final_layer[i](task_final_layer_input[i].squeeze(1))
             output = self.out[i](tower_dnn_logit)
             task_outs.append(output)
         # print(task_outs.shape)
@@ -223,8 +222,9 @@ class MMOEATT(nn.Module):
                 for i, l in enumerate(self.labels):
                     y_train_true[l] += list(y[:, i].cpu().numpy())
                     y_train_predict[l] += list(predict[:, i].cpu().detach().numpy())
+                loss_weight = [1, 1, 1, 10, 10, 10]
                 loss = sum(
-                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
+                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
                 curr_loss = loss + reg_loss
                 self.writer.add_scalar("train_loss", curr_loss.detach().mean(), idx)
@@ -254,8 +254,9 @@ class MMOEATT(nn.Module):
                 val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
                 # val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
                 save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
+                loss_weight = [1, 1, 1, 10, 10, 10]
                 loss = sum(
-                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
+                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
                 curr_loss = loss + reg_loss
                 self.writer.add_scalar("val_loss", curr_loss.detach().mean(), idx)

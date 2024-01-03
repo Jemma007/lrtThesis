@@ -17,12 +17,13 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from model.layers.inputs import varlen_embedding_lookup, get_varlen_pooling_list
+from ..layers.attention import SelfAttentionModule
 from ..layers.core import DNN, PredictionLayer
 from sklearn.metrics import roc_auc_score
 save_data_path = './dataset/data/save/'
 
 
-class MMOEAUX(nn.Module):
+class MMOESDN(nn.Module):
     """
     MMOE for CTCVR problem
     """
@@ -46,7 +47,7 @@ class MMOEAUX(nn.Module):
         :param expert_activation: activation function like 'relu' or 'sigmoid'
         :param num_task: int default 2 multitask numbers
         """
-        super(MMOEAUX, self).__init__()
+        super(MMOEASD, self).__init__()
         torch.manual_seed(seed)
         self.regularization_weight = []
         if gpus and str(self.gpus[0]) not in self.device:
@@ -121,6 +122,8 @@ class MMOEAUX(nn.Module):
             self.add_regularization_weight(
                 filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.tower_dnn.named_parameters()),
                 l2=l2_reg_dnn)
+        # 直接默认塔网络有多层
+        self.self_attention = SelfAttentionModule(tower_dnn_hidden_units[-1], self.num_tasks)
         self.tower_dnn_final_layer = nn.ModuleList([nn.Linear(
             tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
             bias=False) for _ in range(self.num_tasks)])
@@ -212,39 +215,34 @@ class MMOEAUX(nn.Module):
             mmoe_outs.append(gate_mul_expert.squeeze())
 
         # tower dnn (task-specific)
-        task_outs, user_weights = [], []
+        task_dnn_outs, user_weights = [], []
         for i, label in enumerate(self.labels):
-            if len(self.tower_dnn_hidden_units) > 0:
-                tower_dnn_out = self.tower_dnn[i](mmoe_outs[i])
-                # 计算当前任务辅助网络输入
-                emp_label = x[:, self.continuous_feature_dict['emp_'+label][1]].unsqueeze(1).detach()
-                curr_user_dnn_input = torch.cat([user_dnn_input, emp_label], axis=1).float()
-                user_tower_dnn_out = self.user_tower_dnn[i](curr_user_dnn_input)
-                # item_tower_dnn_out = self.item_tower_dnn[i](item_dnn_input)
-                tower_dnn_logit = self.tower_dnn_final_layer[i](tower_dnn_out)
-                user_tower_dnn_logit = self.user_tower_dnn_final_layer[i](user_tower_dnn_out)
-                # item_tower_dnn_logit = self.item_tower_dnn_final_layer[i](item_tower_dnn_out)
-            else:
-                tower_dnn_logit = self.tower_dnn_final_layer[i](mmoe_outs[i])
-                # 计算当前任务辅助网络输入
-                emp_label = x[:, self.continuous_feature_dict['emp_'+label]].unsqueeze(1).detach()
-                curr_user_dnn_input = torch.cat([user_dnn_input, emp_label])
-                user_tower_dnn_logit = self.user_tower_dnn_final_layer[i](curr_user_dnn_input)
-                # item_tower_dnn_logit = self.item_tower_dnn_final_layer[i](item_dnn_input)
-            # 主塔结果处理
-            output = self.out[i](tower_dnn_logit)
-            task_outs.append(output)
+            tower_dnn_out = self.tower_dnn[i](mmoe_outs[i])
+            task_dnn_outs.append(tower_dnn_out)
+            # 计算当前任务辅助网络输入
+            emp_label = x[:, self.continuous_feature_dict['emp_'+label][1]].unsqueeze(1).detach()
+            curr_user_dnn_input = torch.cat([user_dnn_input, emp_label], axis=1).float()
+            user_tower_dnn_out = self.user_tower_dnn[i](curr_user_dnn_input)
+            # item_tower_dnn_out = self.item_tower_dnn[i](item_dnn_input)
+            user_tower_dnn_logit = self.user_tower_dnn_final_layer[i](user_tower_dnn_out)
             # user辅助塔结果处理
             user_output = self.user_out[i](user_tower_dnn_logit)
             user_weights.append(user_output)
-            # item辅助塔结果处理
-            # item_output = self.item_out[i](item_tower_dnn_logit)
-            # item_weights.append(item_output)
+
+        attention_input = torch.stack(task_dnn_outs, dim=1)
+        attention_output = self.self_attention(attention_input)
+        task_final_layer_input = torch.split(attention_output + attention_input, 1, dim=1)
+        task_outs = []
+        for i, label in enumerate(self.labels):
+            tower_dnn_logit = self.tower_dnn_final_layer[i](task_final_layer_input[i].squeeze(1))
+            # 主塔结果处理
+            output = self.out[i](tower_dnn_logit)
+            task_outs.append(output)
 
         task_outs = torch.cat(task_outs, -1)
-        user_weight = torch.cat(user_weights, -1) # (batch size, num_tasks)
+        user_weights = torch.cat(user_weights, -1) # (batch size, num_tasks)
         # item_weight = torch.cat(item_weights, -1)
-        return task_outs, user_weight# , item_weight
+        return task_outs, user_weights# , item_weight
     def add_regularization_weight(self, weight_list, l1=0.0, l2=0.0):
         # For a Parameter, put it in a list to keep Compatible with get_regularization_loss()
         if isinstance(weight_list, torch.nn.parameter.Parameter):
@@ -280,10 +278,7 @@ class MMOEAUX(nn.Module):
                 # predict, user_weight, item_weight = model(x)
                 predict, user_weight = model(x)
                 # user weights处理
-                if idx == 0:
-                    user_avg_weight_in_batch = torch.mean(user_weight, dim=0).detach()
-                else:
-                    user_avg_weight_in_batch = user_avg_weight_in_batch*0.9 + 0.1*torch.mean(user_weight, dim=0).detach()
+                user_avg_weight_in_batch = 0.5
                 user_loss_weight = torch.where(y == 0,
                                                torch.tanh(torch.div((1-user_avg_weight_in_batch), (1-user_weight) + self.eps)),
                                                torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
@@ -434,7 +429,7 @@ class MMOEAUX(nn.Module):
             count_eval += 1
         final_save_message = np.concatenate(save_message, axis=0)
         test_df = pd.DataFrame(final_save_message)
-        test_df.to_csv(save_data_path + 'test_predict_data_mmoeaux.csv', index=False)
+        test_df.to_csv(save_data_path + 'test_predict_data_sdn.csv', index=False)
         auc = dict()
         for l in self.labels:
             auc[l] = roc_auc_score(y_test_true[l], y_test_predict[l])
