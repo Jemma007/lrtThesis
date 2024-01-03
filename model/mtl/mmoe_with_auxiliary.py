@@ -306,9 +306,10 @@ class MMOEAUX(nn.Module):
                 # 计算weight
                 # loss_weight = torch.mul(item_loss_weight, user_loss_weight)
                 loss_weight = user_loss_weight
+                loss_weight_easy = [1, 1, 1, 10, 10, 10]
                 # 计算loss
                 loss = sum(
-                    [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none')) for i in range(self.num_tasks)])
+                    [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none'))*loss_weight_easy[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
                 curr_loss = loss + reg_loss
                 self.writer.add_scalar("train_loss", float(curr_loss), idx)
@@ -351,6 +352,7 @@ class MMOEAUX(nn.Module):
                 # 计算weight
                 # loss_weight = torch.mul(item_loss_weight, user_loss_weight)
                 loss_weight = user_loss_weight
+                loss_weight_easy = [1, 1, 1, 10, 10, 10]
                 # # user_id转换
                 # val_x = x.cpu().numpy()
                 # val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
@@ -358,7 +360,7 @@ class MMOEAUX(nn.Module):
                 # save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy(), user_loss_weight.detach().numpy()], axis=1))
                 # loss计算
                 loss = sum(
-                    [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none')) for i in range(self.num_tasks)])
+                    [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none'))*loss_weight_easy[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
                 curr_loss = loss + reg_loss
                 self.writer.add_scalar("val_loss", curr_loss.detach().mean(), idx)
