@@ -23,7 +23,7 @@ from sklearn.metrics import roc_auc_score
 save_data_path = './dataset/data/save/'
 
 
-class MMOEASD(nn.Module):
+class MMOEWATT(nn.Module):
     """
     MMOE for CTCVR problem
     """
@@ -47,7 +47,7 @@ class MMOEASD(nn.Module):
         :param expert_activation: activation function like 'relu' or 'sigmoid'
         :param num_task: int default 2 multitask numbers
         """
-        super(MMOEASD, self).__init__()
+        super(MMOEWATT, self).__init__()
         torch.manual_seed(seed)
         self.regularization_weight = []
         if gpus and str(self.gpus[0]) not in self.device:
@@ -277,6 +277,7 @@ class MMOEASD(nn.Module):
                 x, y= x.to(device), y.to(device)
                 # predict, user_weight, item_weight = model(x)
                 predict, user_weight = model(x)
+                user_weight = x[:, 77:83].float()# .cpu().numpy()
                 # user weights处理
                 if idx == 0:
                     user_avg_weight_in_batch = torch.mean(user_weight, dim=0).detach()
@@ -335,6 +336,7 @@ class MMOEASD(nn.Module):
                 x, y = x.to(device), y.to(device)
                 # predict, user_weight, item_weight = model(x)
                 predict, user_weight = model(x)
+                user_weight = x[:, 77:83].float()# .cpu.numpy()
                 for i, l in enumerate(self.labels):
                     y_val_true[l] += list(y[:,i].cpu().numpy())
                     y_val_predict[l] += list(predict[:, i].cpu().detach().numpy())
@@ -401,6 +403,7 @@ class MMOEASD(nn.Module):
             x, y = x.to(device), y.to(device)
             # predict, user_weight, item_weight = model(x)
             predict, user_weight = model(x)
+            user_weight = x[:, 77:83].float()# .cpu().numpy()
             for i, l in enumerate(self.labels):
                 y_test_true[l] += list(y[:, i].cpu().numpy())
                 y_test_predict[l] += list(predict[:, i].cpu().detach().numpy())
@@ -432,7 +435,7 @@ class MMOEASD(nn.Module):
             count_eval += 1
         final_save_message = np.concatenate(save_message, axis=0)
         test_df = pd.DataFrame(final_save_message)
-        test_df.to_csv(save_data_path + 'test_predict_data_mmoeasd.csv', index=False)
+        test_df.to_csv(save_data_path + 'test_predict_data_watt.csv', index=False)
         auc = dict()
         for l in self.labels:
             auc[l] = roc_auc_score(y_test_true[l], y_test_predict[l])

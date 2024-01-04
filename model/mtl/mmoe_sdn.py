@@ -47,7 +47,7 @@ class MMOESDN(nn.Module):
         :param expert_activation: activation function like 'relu' or 'sigmoid'
         :param num_task: int default 2 multitask numbers
         """
-        super(MMOEASD, self).__init__()
+        super(MMOESDN, self).__init__()
         torch.manual_seed(seed)
         self.regularization_weight = []
         if gpus and str(self.gpus[0]) not in self.device:
@@ -311,7 +311,7 @@ class MMOESDN(nn.Module):
                 for i, l in enumerate(self.labels):
                     y_train_true[l] += list(y[:, i].cpu().numpy())
                     y_train_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                    self.writer.add_scalar("user_"+l+'_batch_avg', user_avg_weight_in_batch[i], idx)
+                    # self.writer.add_scalar("user_"+l+'_batch_avg', user_avg_weight_in_batch[i], idx)
                 optimizer.zero_grad()
                 curr_loss.backward()
                 optimizer.step()
