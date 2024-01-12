@@ -171,7 +171,7 @@ class MMOEASD(nn.Module):
         for cat_feature, num in self.categorical_feature_dict.items():
             cat_embed_list.append(self.embedding_dict[cat_feature](x[:, num[1]].long()))
             if cat_feature in self.user_features:
-                user_cat_embed = self.embedding_dict[cat_feature](x[:, num[1]].long()).detach()
+                user_cat_embed = self.embedding_dict[cat_feature](x[:, num[1]].long())# .detach()
                 user_cat_embed_list.append(user_cat_embed)
 
         for con_feature, num in self.continuous_feature_dict.items():
@@ -220,7 +220,7 @@ class MMOEASD(nn.Module):
             tower_dnn_out = self.tower_dnn[i](mmoe_outs[i])
             task_dnn_outs.append(tower_dnn_out)
             # 计算当前任务辅助网络输入
-            emp_label = x[:, self.continuous_feature_dict['emp_'+label][1]].unsqueeze(1).detach()
+            emp_label = x[:, self.continuous_feature_dict['emp_'+label][1]].unsqueeze(1)# .detach()
             curr_user_dnn_input = torch.cat([user_dnn_input, emp_label], axis=1).float()
             user_tower_dnn_out = self.user_tower_dnn[i](curr_user_dnn_input)
             # item_tower_dnn_out = self.item_tower_dnn[i](item_dnn_input)

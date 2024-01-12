@@ -21,13 +21,13 @@ from sklearn.metrics import roc_auc_score
 save_data_path = './dataset/data/save/'
 
 
-class MMOE(nn.Module):
+class PLE(nn.Module):
     """
     MMOE for CTCVR problem
     """
 
     def __init__(self, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=128,
-                 num_experts=3, expert_dnn_hidden_units=(256, 128),
+                 num_level=2, specific_expert_num=1, shared_expert_num=1, expert_dnn_hidden_units=(256, 128),
                  gate_dnn_hidden_units=(64,), tower_dnn_hidden_units=(64,),
                  l2_reg_embedding=0.00001, l2_reg_dnn=0,
                  init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu', dnn_use_bn=True,
@@ -45,7 +45,7 @@ class MMOE(nn.Module):
         :param expert_activation: activation function like 'relu' or 'sigmoid'
         :param num_task: int default 2 multitask numbers
         """
-        super(MMOE, self).__init__()
+        super(PLE, self).__init__()
         torch.manual_seed(seed)
         self.regularization_weight = []
         if gpus and str(self.gpus[0]) not in self.device:
@@ -64,7 +64,9 @@ class MMOE(nn.Module):
         self.continuous_feature_dict = continuous_feature_dict
         self.var_cat_feature_dict = var_cat_feature_dict
         self.num_tasks = len(labels)
-        self.num_experts = num_experts
+        self.specific_expert_num = specific_expert_num
+        self.shared_expert_num = shared_expert_num
+        self.num_level = num_level
         self.writer = writer
         self.labels = labels
         self.task_types = ['binary']*self.num_tasks
@@ -108,19 +110,40 @@ class MMOE(nn.Module):
         self.shared_experts = multi_module_list(self.num_levels, 1, self.specific_expert_num,
                                                 self.input_dim, expert_dnn_hidden_units[-1], expert_dnn_hidden_units)
 
-        # gate dnn
+        # 2. gates
+        # gates for task-specific experts
+        specific_gate_output_dim = self.specific_expert_num + self.shared_expert_num
         if len(gate_dnn_hidden_units) > 0:
-            self.gate_dnn = nn.ModuleList([DNN(self.input_dim, gate_dnn_hidden_units, activation=dnn_activation,
-                                               l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
-                                               init_std=init_std, device=device) for _ in range(self.num_tasks)])
+            self.specific_gate_dnn = multi_module_list(self.num_levels, self.num_tasks, 1,
+                                                       self.input_dim, expert_dnn_hidden_units[-1],
+                                                       gate_dnn_hidden_units)
             self.add_regularization_weight(
-                filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.gate_dnn.named_parameters()),
+                filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.specific_gate_dnn.named_parameters()),
                 l2=l2_reg_dnn)
-        self.gate_dnn_final_layer = nn.ModuleList(
-            [nn.Linear(gate_dnn_hidden_units[-1] if len(gate_dnn_hidden_units) > 0 else self.input_dim,
-                       self.num_experts, bias=False) for _ in range(self.num_tasks)])
+        self.specific_gate_dnn_final_layer = nn.ModuleList(
+            [nn.ModuleList([nn.Linear(
+                gate_dnn_hidden_units[-1] if len(gate_dnn_hidden_units) > 0 else self.input_dim if level_num == 0 else
+                expert_dnn_hidden_units[-1], specific_gate_output_dim, bias=False)
+                for _ in range(self.num_tasks)]) for level_num in range(self.num_levels)])
 
-        # tower dnn (task-specific)
+        # gates for shared experts
+        shared_gate_output_dim = self.num_tasks * self.specific_expert_num + self.shared_expert_num
+        if len(gate_dnn_hidden_units) > 0:
+            self.shared_gate_dnn = nn.ModuleList([DNN(self.input_dim if level_num == 0 else expert_dnn_hidden_units[-1],
+                                                      gate_dnn_hidden_units, activation=dnn_activation,
+                                                      l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
+                                                      init_std=init_std, device=device) for level_num in
+                                                  range(self.num_levels)])
+            self.add_regularization_weight(
+                filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.shared_gate_dnn.named_parameters()),
+                l2=l2_reg_dnn)
+        self.shared_gate_dnn_final_layer = nn.ModuleList(
+            [nn.Linear(
+                gate_dnn_hidden_units[-1] if len(gate_dnn_hidden_units) > 0 else self.input_dim if level_num == 0 else
+                expert_dnn_hidden_units[-1], shared_gate_output_dim, bias=False)
+                for level_num in range(self.num_levels)])
+
+        # 3. tower dnn (task-specific)
         if len(tower_dnn_hidden_units) > 0:
             self.tower_dnn = nn.ModuleList(
                 [DNN(expert_dnn_hidden_units[-1], tower_dnn_hidden_units, activation=dnn_activation,
@@ -132,15 +155,66 @@ class MMOE(nn.Module):
         self.tower_dnn_final_layer = nn.ModuleList([nn.Linear(
             tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
             bias=False)
-                                                    for _ in range(self.num_tasks)])
+            for _ in range(self.num_tasks)])
 
         self.out = nn.ModuleList([PredictionLayer(task) for task in self.task_types])
 
-        regularization_modules = [self.expert_dnn, self.gate_dnn_final_layer, self.tower_dnn_final_layer]
+        regularization_modules = [self.specific_experts, self.shared_experts, self.specific_gate_dnn_final_layer,
+                                  self.shared_gate_dnn_final_layer, self.tower_dnn_final_layer]
         for module in regularization_modules:
             self.add_regularization_weight(
                 filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], module.named_parameters()), l2=l2_reg_dnn)
         self.to(device)
+
+    # a single cgc Layer
+    def cgc_net(self, inputs, level_num):
+        # inputs: [task1, task2, ... taskn, shared task]
+
+        # 1. experts
+        # task-specific experts
+        specific_expert_outputs = []
+        for i in range(self.num_tasks):
+            for j in range(self.specific_expert_num):
+                specific_expert_output = self.specific_experts[level_num][i][j](inputs[i])
+                specific_expert_outputs.append(specific_expert_output)
+
+        # shared experts
+        shared_expert_outputs = []
+        for k in range(self.shared_expert_num):
+            shared_expert_output = self.shared_experts[level_num][0][k](inputs[-1])
+            shared_expert_outputs.append(shared_expert_output)
+
+        # 2. gates
+        # gates for task-specific experts
+        cgc_outs = []
+        for i in range(self.num_tasks):
+            # concat task-specific expert and task-shared expert
+            cur_experts_outputs = specific_expert_outputs[
+                                  i * self.specific_expert_num:(i + 1) * self.specific_expert_num] + shared_expert_outputs
+            cur_experts_outputs = torch.stack(cur_experts_outputs, 1)
+
+            # gate dnn
+            if len(self.gate_dnn_hidden_units) > 0:
+                gate_dnn_out = self.specific_gate_dnn[level_num][i][0](inputs[i])
+                gate_dnn_out = self.specific_gate_dnn_final_layer[level_num][i](gate_dnn_out)
+            else:
+                gate_dnn_out = self.specific_gate_dnn_final_layer[level_num][i](inputs[i])
+            gate_mul_expert = torch.matmul(gate_dnn_out.softmax(1).unsqueeze(1), cur_experts_outputs)  # (bs, 1, dim)
+            cgc_outs.append(gate_mul_expert.squeeze())
+
+        # gates for shared experts
+        cur_experts_outputs = specific_expert_outputs + shared_expert_outputs
+        cur_experts_outputs = torch.stack(cur_experts_outputs, 1)
+
+        if len(self.gate_dnn_hidden_units) > 0:
+            gate_dnn_out = self.shared_gate_dnn[level_num](inputs[-1])
+            gate_dnn_out = self.shared_gate_dnn_final_layer[level_num](gate_dnn_out)
+        else:
+            gate_dnn_out = self.shared_gate_dnn_final_layer[level_num](inputs[-1])
+        gate_mul_expert = torch.matmul(gate_dnn_out.softmax(1).unsqueeze(1), cur_experts_outputs)  # (bs, 1, dim)
+        cgc_outs.append(gate_mul_expert.squeeze())
+
+        return cgc_outs
 
 
     def forward(self, x):
@@ -163,38 +237,24 @@ class MMOE(nn.Module):
 
         # hidden layer
         dnn_input = torch.cat([cat_embed, con_embed, varelen_embed], axis=1).float()  # batch * hidden_size
-        # print(dnn_input)
-        # expert dnn
-        expert_outs = []
-        for i in range(self.num_experts):
-            expert_out = self.expert_dnn[i](dnn_input)
-            expert_outs.append(expert_out)
-        expert_outs = torch.stack(expert_outs, 1)  # (bs, num_experts, dim)
-        # print(expert_outs.shape)
-        # print(expert_outs)
-        # gate dnn
-        mmoe_outs = []
-        for i in range(self.num_tasks):
-            if len(self.gate_dnn_hidden_units) > 0:
-                gate_dnn_out = self.gate_dnn[i](dnn_input)
-                gate_dnn_out = self.gate_dnn_final_layer[i](gate_dnn_out)
-            else:
-                gate_dnn_out = self.gate_dnn_final_layer[i](dnn_input)
-            gate_mul_expert = torch.matmul(gate_dnn_out.softmax(1).unsqueeze(1), expert_outs)  # (bs, 1, dim)
-            mmoe_outs.append(gate_mul_expert.squeeze())
+
+        # repeat `dnn_input` for several times to generate cgc input
+        ple_inputs = [dnn_input] * (self.num_tasks + 1)  # [task1, task2, ... taskn, shared task]
+        ple_outputs = []
+        for i in range(self.num_levels):
+            ple_outputs = self.cgc_net(inputs=ple_inputs, level_num=i)
+            ple_inputs = ple_outputs
 
         # tower dnn (task-specific)
         task_outs = []
         for i in range(self.num_tasks):
             if len(self.tower_dnn_hidden_units) > 0:
-                tower_dnn_out = self.tower_dnn[i](mmoe_outs[i])
+                tower_dnn_out = self.tower_dnn[i](ple_outputs[i])
                 tower_dnn_logit = self.tower_dnn_final_layer[i](tower_dnn_out)
             else:
-                tower_dnn_logit = self.tower_dnn_final_layer[i](mmoe_outs[i])
+                tower_dnn_logit = self.tower_dnn_final_layer[i](ple_outputs[i])
             output = self.out[i](tower_dnn_logit)
             task_outs.append(output)
-        # print(task_outs.shape)
-        # print(task_outs)
         task_outs = torch.cat(task_outs, -1)
         return task_outs
     def add_regularization_weight(self, weight_list, l1=0.0, l2=0.0):
