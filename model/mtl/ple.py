@@ -27,7 +27,7 @@ class PLE(nn.Module):
     """
 
     def __init__(self, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=128,
-                 num_level=2, specific_expert_num=1, shared_expert_num=1, expert_dnn_hidden_units=(256, 128),
+                 num_levels=2, specific_expert_num=1, shared_expert_num=1, expert_dnn_hidden_units=(256, 128),
                  gate_dnn_hidden_units=(64,), tower_dnn_hidden_units=(64,),
                  l2_reg_embedding=0.00001, l2_reg_dnn=0,
                  init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu', dnn_use_bn=True,
@@ -66,7 +66,7 @@ class PLE(nn.Module):
         self.num_tasks = len(labels)
         self.specific_expert_num = specific_expert_num
         self.shared_expert_num = shared_expert_num
-        self.num_level = num_level
+        self.num_levels = num_levels
         self.writer = writer
         self.labels = labels
         self.task_types = ['binary']*self.num_tasks
