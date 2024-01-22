@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from model.layers.inputs import varlen_embedding_lookup, get_varlen_pooling_list
+from ..layers.attention import SelfAttentionModule
 from ..layers.core import DNN, PredictionLayer
 from sklearn.metrics import roc_auc_score
 save_data_path = './dataset/data/save/'
@@ -26,7 +27,7 @@ class PLEASD(nn.Module):
     MMOE for CTCVR problem
     """
 
-    def __init__(self, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=128,
+    def __init__(self, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, writer, emb_dim=128,
                  num_levels=2, specific_expert_num=1, shared_expert_num=1, expert_dnn_hidden_units=(256, 128),
                  gate_dnn_hidden_units=(64,), tower_dnn_hidden_units=(64,),
                  l2_reg_embedding=0.00001, l2_reg_dnn=0,
@@ -63,6 +64,7 @@ class PLEASD(nn.Module):
         self.categorical_feature_dict = categorical_feature_dict
         self.continuous_feature_dict = continuous_feature_dict
         self.var_cat_feature_dict = var_cat_feature_dict
+        self.user_features = user_features
         self.num_tasks = len(labels)
         self.specific_expert_num = specific_expert_num
         self.shared_expert_num = shared_expert_num
@@ -70,6 +72,7 @@ class PLEASD(nn.Module):
         self.writer = writer
         self.labels = labels
         self.task_types = ['binary']*self.num_tasks
+        self.eps = torch.FloatTensor([1e-8]).to(device)
         # TODO
         self.loss_function = [F.binary_cross_entropy]*self.num_tasks
         # print(len(self.categorical_feature_dict), len(self.continuous_feature_dict), len(self.history_feature_dict))
@@ -91,6 +94,8 @@ class PLEASD(nn.Module):
 
         # user embedding + item embedding
         self.input_dim = emb_dim * (len(self.categorical_feature_dict) + len(self.var_cat_feature_dict)) + len(continuous_feature_dict)
+        self.user_cat_feature_len = len(set(self.categorical_feature_dict.keys()) & set(self.user_features))
+        self.user_input_dim = emb_dim * (self.user_cat_feature_len + len(self.var_cat_feature_dict)) + 1#  + len(self.user_features) - self.user_cat_feature_len + 1
 
         def multi_module_list(num_level, num_tasks, expert_num, inputs_dim_level0, inputs_dim_not_level0, hidden_units):
             return nn.ModuleList(
@@ -152,12 +157,28 @@ class PLEASD(nn.Module):
             self.add_regularization_weight(
                 filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.tower_dnn.named_parameters()),
                 l2=l2_reg_dnn)
+
+        # 直接默认塔网络有多层
+        self.self_attention = SelfAttentionModule(tower_dnn_hidden_units[-1], self.num_tasks)
         self.tower_dnn_final_layer = nn.ModuleList([nn.Linear(
             tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
             bias=False)
             for _ in range(self.num_tasks)])
 
+        # 4. user tower (task-specific)
+        self.user_tower_dnn = nn.ModuleList(
+            [DNN(self.user_input_dim, tower_dnn_hidden_units, activation=dnn_activation,
+                 l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
+                 init_std=init_std, device=device) for _ in range(self.num_tasks)])
+        self.add_regularization_weight(
+            filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.user_tower_dnn.named_parameters()),
+            l2=l2_reg_dnn)
+        self.user_tower_dnn_final_layer = nn.ModuleList([nn.Linear(
+            tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
+            bias=False) for _ in range(self.num_tasks)])
+
         self.out = nn.ModuleList([PredictionLayer(task) for task in self.task_types])
+        self.user_out = nn.ModuleList([PredictionLayer(task) for task in self.task_types])
 
         regularization_modules = [self.specific_experts, self.shared_experts, self.specific_gate_dnn_final_layer,
                                   self.shared_gate_dnn_final_layer, self.tower_dnn_final_layer]
@@ -220,9 +241,12 @@ class PLEASD(nn.Module):
     def forward(self, x):
         # assert x.size()[1] == len(self.categorical_feature_dict) + len(self.continuous_feature_dict) + len(self.var_cat_feature_dict)*20+1
         # embedding
-        cat_embed_list, con_embed_list = list(), list()
+        cat_embed_list, con_embed_list, user_cat_embed_list = list(), list(), list()
         for cat_feature, num in self.categorical_feature_dict.items():
             cat_embed_list.append(self.embedding_dict[cat_feature](x[:, num[1]].long()))
+            if cat_feature in self.user_features:
+                user_cat_embed = self.embedding_dict[cat_feature](x[:, num[1]].long())# .detach()
+                user_cat_embed_list.append(user_cat_embed)
 
         for con_feature, num in self.continuous_feature_dict.items():
             con_embed_list.append(x[:, num[1]].unsqueeze(1))
@@ -235,8 +259,12 @@ class PLEASD(nn.Module):
         con_embed = torch.cat(con_embed_list, axis=1)
         varelen_embed = torch.cat(varlen_embed_list, axis=1)
 
+        # 用户辅助网络 embedding concat
+        user_cat_embed = torch.cat(user_cat_embed_list, axis=1)
+
         # hidden layer
         dnn_input = torch.cat([cat_embed, con_embed, varelen_embed], axis=1).float()  # batch * hidden_size
+        user_dnn_input = torch.cat([user_cat_embed, varelen_embed], axis=1).float()
 
         # repeat `dnn_input` for several times to generate cgc input
         ple_inputs = [dnn_input] * (self.num_tasks + 1)  # [task1, task2, ... taskn, shared task]
@@ -246,17 +274,32 @@ class PLEASD(nn.Module):
             ple_inputs = ple_outputs
 
         # tower dnn (task-specific)
+        task_dnn_outs, user_weights = [], []
+        for i, label in enumerate(self.labels):
+            tower_dnn_out = self.tower_dnn[i](ple_outputs[i])
+            task_dnn_outs.append(tower_dnn_out)
+            # 计算当前任务辅助网络输入
+            emp_label = x[:, self.continuous_feature_dict['emp_'+label][1]].unsqueeze(1)# .detach()
+            curr_user_dnn_input = torch.cat([user_dnn_input, emp_label], axis=1).float()
+            user_tower_dnn_out = self.user_tower_dnn[i](curr_user_dnn_input)
+            user_tower_dnn_logit = self.user_tower_dnn_final_layer[i](user_tower_dnn_out)
+            # user辅助塔结果处理
+            user_output = self.user_out[i](user_tower_dnn_logit)
+            user_weights.append(user_output)
+
+        attention_input = torch.stack(task_dnn_outs, dim=1)
+        attention_output = self.self_attention(attention_input)
+        task_final_layer_input = torch.split(attention_output + attention_input, 1, dim=1)
         task_outs = []
-        for i in range(self.num_tasks):
-            if len(self.tower_dnn_hidden_units) > 0:
-                tower_dnn_out = self.tower_dnn[i](ple_outputs[i])
-                tower_dnn_logit = self.tower_dnn_final_layer[i](tower_dnn_out)
-            else:
-                tower_dnn_logit = self.tower_dnn_final_layer[i](ple_outputs[i])
+        for i, label in enumerate(self.labels):
+            tower_dnn_logit = self.tower_dnn_final_layer[i](task_final_layer_input[i].squeeze(1))
+            # 主塔结果处理
             output = self.out[i](tower_dnn_logit)
             task_outs.append(output)
+
         task_outs = torch.cat(task_outs, -1)
-        return task_outs
+        user_weights = torch.cat(user_weights, -1)
+        return task_outs, user_weights
     def add_regularization_weight(self, weight_list, l1=0.0, l2=0.0):
         # For a Parameter, put it in a list to keep Compatible with get_regularization_loss()
         if isinstance(weight_list, torch.nn.parameter.Parameter):
@@ -286,16 +329,28 @@ class PLEASD(nn.Module):
             total_loss, count = 0, 0
             for idx, (x, y) in tqdm(enumerate(train_loader)):
                 x, y= x.to(device), y.to(device)
-                predict = model(x)
+                predict, user_weight = model(x)
+                # user weights处理
+                if idx == 0:
+                    user_avg_weight_in_batch = torch.mean(user_weight, dim=0).detach()
+                else:
+                    user_avg_weight_in_batch = user_avg_weight_in_batch * 0.9 + 0.1 * torch.mean(user_weight,
+                                                                                                 dim=0).detach()
+                user_loss_weight = torch.where(y == 0,
+                                               torch.tanh(torch.div((1 - user_avg_weight_in_batch),
+                                                                    (1 - user_weight) + self.eps)),
+                                               torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
+                loss_weight = user_loss_weight
+                loss_weight_easy = [1, 1, 1, 1, 10, 10]
+                # 计算loss
+                loss = sum(
+                    [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none'))*loss_weight_easy[i] for i in range(self.num_tasks)])
+                reg_loss = self.get_regularization_loss()
+                curr_loss = loss + reg_loss
+                self.writer.add_scalar("train_loss", float(curr_loss), idx)
                 for i, l in enumerate(self.labels):
                     y_train_true[l] += list(y[:, i].cpu().numpy())
                     y_train_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                loss_weight = [1, 1, 1, 10, 10, 10]
-                loss = sum(
-                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
-                reg_loss = self.get_regularization_loss()
-                curr_loss = loss + reg_loss
-                self.writer.add_scalar("train_loss", curr_loss.detach().mean(), idx)
                 optimizer.zero_grad()
                 curr_loss.backward()
                 optimizer.step()
@@ -314,25 +369,24 @@ class PLEASD(nn.Module):
             save_message = []
             for idx, (x, y) in enumerate(val_loader):
                 x, y = x.to(device), y.to(device)
-                predict = model(x)
+                predict, user_weight = model(x)
                 for i, l in enumerate(self.labels):
-                    y_val_true[l] += list(y[:,i].cpu().numpy())
+                    y_val_true[l] += list(y[:, i].cpu().numpy())
                     y_val_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                val_x = x.cpu().numpy()
-                val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
-                val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
-                save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
-                loss_weight = [1, 1, 1, 10, 10, 10]
+                # user weights处理
+                user_loss_weight = torch.where(y == 0,
+                                               torch.tanh(torch.div((1 - user_avg_weight_in_batch),
+                                                                    (1 - user_weight) + self.eps)),
+                                               torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
+                loss_weight = user_loss_weight
+                loss_weight_easy = [1, 1, 1, 1, 10, 10]
                 loss = sum(
-                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
+                    [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none'))*loss_weight_easy[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
                 curr_loss = loss + reg_loss
                 self.writer.add_scalar("val_loss", curr_loss.detach().mean(), idx)
                 total_eval_loss += float(curr_loss)
                 count_eval += 1
-            final_save_message = np.concatenate(save_message, axis=0)
-            val_df = pd.DataFrame(final_save_message)
-            val_df.to_csv(save_data_path+'val_predict_data.csv', index=False)
             auc = dict()
             for l in self.labels:
                 auc[l] = roc_auc_score(y_val_true[l], y_val_predict[l])
@@ -364,16 +418,26 @@ class PLEASD(nn.Module):
         y_test_predict = collections.defaultdict(list)
         for idx, (x, y) in enumerate(test_loader):
             x, y = x.to(device), y.to(device)
-            predict = model(x)
+            predict, user_weight = model(x)
             for i, l in enumerate(self.labels):
                 y_test_true[l] += list(y[:, i].cpu().numpy())
                 y_test_predict[l] += list(predict[:, i].cpu().detach().numpy())
+            # user weights处理
+            user_loss_weight = torch.where(y == 0,
+                                           torch.tanh(
+                                               torch.div((1 - user_avg_weight_in_batch), (1 - user_weight) + self.eps)),
+                                           torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
+            loss_weight = user_loss_weight
+            # user_id转换
             test_x = x.cpu().numpy()
             test_x[:, 0] = le['user_id'].inverse_transform(test_x[:, 0].astype(int))
-            # test_x[:, 27] = le['video_id'].inverse_transform(test_x[:, 27].astype(int))
-            save_message.append(np.concatenate([test_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
+            test_x[:, 27] = le['video_id'].inverse_transform(test_x[:, 27].astype(int))
+            save_message.append(np.concatenate(
+                [test_x, y.cpu().numpy(), predict.cpu().detach().numpy(), user_loss_weight.detach().numpy()], axis=1))
+            # loss计算
             loss = sum(
-                [self.loss_function[i](predict[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
+                [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none')) for
+                 i in range(self.num_tasks)])
             reg_loss = self.get_regularization_loss()
             curr_loss = loss + reg_loss
             self.writer.add_scalar("test_loss", curr_loss.detach().mean(), idx)
@@ -381,11 +445,12 @@ class PLEASD(nn.Module):
             count_test += 1
         final_save_message = np.concatenate(save_message, axis=0)
         test_df = pd.DataFrame(final_save_message)
-        test_df.to_csv(save_data_path+'test_predict_data_ple.csv', index=False)
+        test_df.to_csv(save_data_path + 'test_predict_data_pleasd.csv', index=False)
         auc = dict()
         for l in self.labels:
             auc[l] = roc_auc_score(y_test_true[l], y_test_predict[l])
-            print("test loss is %.3f, %s auc is %.3f" % (total_test_loss / count_test, l, auc[l]))
+            print("Epoch %d test loss is %.3f, %s auc is %.3f" % (e + 1, total_test_loss / count_test, l, auc[l]))
+
 
     def get_regularization_loss(self, ):
         total_reg_loss = torch.zeros((1,), device=self.device)

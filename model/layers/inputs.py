@@ -3,7 +3,7 @@
 Author:
     Weichen Shen,weichenswc@163.com
 """
-
+import collections
 from collections import OrderedDict, namedtuple, defaultdict
 from itertools import chain
 
@@ -132,6 +132,18 @@ def get_varlen_pooling_list(embedding_dict, features, feature_index, device):
         varlen_sparse_embedding_list.append(emb)
     return varlen_sparse_embedding_list
 
+def stem_get_varlen_pooling_list(embedding_dict, features, feature_index, num_tasks, device):
+    varlen_sparse_embedding_list = [[] for _ in range(num_tasks+1)]
+    for feat in feature_index.keys():
+        seq_embs = embedding_dict[feat]
+        seq_length = features[:, feature_index[feat][2]].long()
+        for i, seq_emb in enumerate(seq_embs):
+            emb = SequencePoolingLayer(mode='mean', supports_masking=False, device=device)(
+                    [seq_emb, seq_length])
+            emb = emb.squeeze(dim=1)
+            varlen_sparse_embedding_list[i].append(emb)
+    return varlen_sparse_embedding_list
+
 
 def create_embedding_matrix(feature_columns, init_std=0.0001, linear=False, sparse=False, device='cpu'):
     # Return nn.ModuleDict: for sparse features, {embedding_name: nn.Embedding}
@@ -198,6 +210,27 @@ def varlen_embedding_lookup(X, embedding_dict, sequence_input_dict):
             # print(X[:, lookup_idx[0]:lookup_idx[1]+1], lookup_idx[0], lookup_idx[1], lookup_idx[2])
             # print(X[:, lookup_idx[2]])
             varlen_embedding_vec_dict[feature_name] = embedding_dict['tag'](X[:, lookup_idx[0]:lookup_idx[1]+1].long())  # (lookup_idx)
+
+    return varlen_embedding_vec_dict
+
+
+def stem_varlen_embedding_lookup(X, embedding_dict, sequence_input_dict, embedding_dim, num_tasks):
+    varlen_embedding_vec_dict = collections.defaultdict(list)
+    for feature_name in sequence_input_dict.keys():
+        lookup_idx = sequence_input_dict[feature_name]
+        if feature_name.endswith('id'):
+            varlen_emb = embedding_dict['video_id'](X[:, lookup_idx[0]:lookup_idx[1] + 1].long())
+            varlen_embs = varlen_emb.split(embedding_dim, dim=2)
+            # print(len(varlen_embs), varlen_embs[0].shape, varlen_emb.shape)
+            for i in range(num_tasks + 1):
+                varlen_embedding_vec_dict[feature_name].append(varlen_embs[i])
+        else:
+            # print(X[:, lookup_idx[0]:lookup_idx[1]+1], lookup_idx[0], lookup_idx[1], lookup_idx[2])
+            # print(X[:, lookup_idx[2]])
+            varlen_emb = embedding_dict['tag'](X[:, lookup_idx[0]:lookup_idx[1] + 1].long())
+            varlen_embs = varlen_emb.split(embedding_dim, dim=2)
+            for i in range(num_tasks + 1):
+                varlen_embedding_vec_dict[feature_name].append(varlen_embs[i])
 
     return varlen_embedding_vec_dict
 
