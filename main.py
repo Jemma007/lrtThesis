@@ -15,6 +15,7 @@ from model.mtl.ple import PLE
 from torch.utils.tensorboard import SummaryWriter
 
 from model.mtl.ple_asd import PLEASD
+from model.mtl.stem_asd import STEMASD
 
 writer = SummaryWriter(log_dir='runs')
 
@@ -126,6 +127,9 @@ if __name__ == "__main__":
                     device=args.device)
     elif args.model_name == 'stem':
         model = STEM(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=args.embedding_size,
+                    device=args.device)
+    elif args.model_name == 'stemasd':
+        model = STEMASD(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, writer, emb_dim=args.embedding_size,
                     device=args.device)
     # writer.add_graph(model, next(train_dataloader))
     # print(model)
