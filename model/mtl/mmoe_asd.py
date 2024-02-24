@@ -171,7 +171,7 @@ class MMOEASD(nn.Module):
         for cat_feature, num in self.categorical_feature_dict.items():
             cat_embed_list.append(self.embedding_dict[cat_feature](x[:, num[1]].long()))
             if cat_feature in self.user_features:
-                user_cat_embed = self.embedding_dict[cat_feature](x[:, num[1]].long())# .detach()
+                user_cat_embed = self.embedding_dict[cat_feature](x[:, num[1]].long()).detach()
                 user_cat_embed_list.append(user_cat_embed)
 
         for con_feature, num in self.continuous_feature_dict.items():
@@ -267,7 +267,7 @@ class MMOEASD(nn.Module):
         # train
         model.train()
         user_avg_weight_in_batch = torch.zeros((self.num_tasks, 1))
-        item_avg_weight_in_batch = torch.zeros((self.num_tasks, 1))
+        # item_avg_weight_in_batch = torch.zeros((self.num_tasks, 1))
         # save_message = []
         for e in range(epoch):
             y_train_true = collections.defaultdict(list)
@@ -304,7 +304,7 @@ class MMOEASD(nn.Module):
                 # 计算weight
                 # loss_weight = torch.mul(item_loss_weight, user_loss_weight)
                 loss_weight = user_loss_weight
-                loss_weight_easy = [1, 1, 1, 10, 10, 10]
+                loss_weight_easy = [1, 1, 1, 1, 1, 1]
                 # 计算loss
                 loss = sum(
                     [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none'))*loss_weight_easy[i] for i in range(self.num_tasks)])
@@ -350,7 +350,6 @@ class MMOEASD(nn.Module):
                 # 计算weight
                 # loss_weight = torch.mul(item_loss_weight, user_loss_weight)
                 loss_weight = user_loss_weight
-                loss_weight_easy = [1, 1, 1, 10, 10, 10]
                 # # user_id转换
                 # val_x = x.cpu().numpy()
                 # val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
@@ -393,7 +392,7 @@ class MMOEASD(nn.Module):
         model.load_state_dict(state)
         total_test_loss = 0
         model.eval()
-        count_eval = 0
+        count_test = 0
         y_test_true = collections.defaultdict(list)
         y_test_predict = collections.defaultdict(list)
         save_message = []
@@ -429,14 +428,14 @@ class MMOEASD(nn.Module):
             curr_loss = loss + reg_loss
             self.writer.add_scalar("test_loss", curr_loss.detach().mean(), idx)
             total_test_loss += float(curr_loss)
-            count_eval += 1
+            count_test += 1
         final_save_message = np.concatenate(save_message, axis=0)
         test_df = pd.DataFrame(final_save_message)
         test_df.to_csv(save_data_path + 'test_predict_data_mmoeasd.csv', index=False)
         auc = dict()
         for l in self.labels:
             auc[l] = roc_auc_score(y_test_true[l], y_test_predict[l])
-            print("Epoch %d test loss is %.3f, %s auc is %.3f" % (e + 1, total_test_loss / count_eval, l, auc[l]))
+            print("Epoch %d test loss is %.3f, %s auc is %.3f" % (e + 1, total_test_loss / count_test, l, auc[l]))
 
     def get_regularization_loss(self, ):
         total_reg_loss = torch.zeros((1,), device=self.device)
