@@ -1,14 +1,21 @@
 import argparse
-import datetime
 import random
 import torch
 import os
 import numpy as np
 from dataset.concat_data import process_data
-from model.mtl.mmoe_with_auxiliary import MMOEAUD
-from model.mtl.esmm import ESMM
+from model.mtl.stem import STEM
+from model.mtl.mmoe_asd import MMOEASD
+from model.mtl.mmoe_sdn import MMOESDN
+from model.mtl.mmoe_watt import MMOEWATT
+from model.mtl.mmoe_with_attention import MMOEATT
+from model.mtl.mmoe_with_auxiliary import MMOEAUX
 from model.mtl.mmoe import MMOE
+from model.mtl.ple import PLE
 from torch.utils.tensorboard import SummaryWriter
+
+from model.mtl.ple_asd import PLEASD
+
 writer = SummaryWriter(log_dir='runs')
 
 torch.autograd.set_detect_anomaly(True) # 启动异常检测
@@ -92,12 +99,34 @@ if __name__ == "__main__":
     data_path = './Data Processing/data/QK_article_1w_final.csv'
 
     train_dataloader, val_dataloader, test_dataloader, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, le = process_data(args)
-    if args.model_name == 'aud':
-        model = MMOEAUD(categorical_feature_dict, continuous_feature_dict, user_features, labels, writer,
+    print(args.model_name, args.epochs)
+    if args.model_name == 'aux':
+        model = MMOEAUX(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, writer,
                         emb_dim=args.embedding_size, device=args.device)
-    else:
+    elif args.model_name == 'mmoe':
         model = MMOE(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=args.embedding_size,
                      device=args.device)
+    elif args.model_name == 'att':
+        model = MMOEATT(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=args.embedding_size,
+                     device=args.device)
+    elif args.model_name == 'mmoeasd':
+        model = MMOEASD(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, writer, emb_dim=args.embedding_size,
+                     device=args.device)
+    elif args.model_name == 'sdn':
+        model = MMOESDN(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, writer, emb_dim=args.embedding_size,
+                     device=args.device)
+    elif args.model_name == 'watt':
+        model = MMOEWATT(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, writer, emb_dim=args.embedding_size,
+                     device=args.device)
+    elif args.model_name == 'ple':
+        model = PLE(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=args.embedding_size,
+                     device=args.device)
+    elif args.model_name == 'pleasd':
+        model = PLEASD(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, writer, emb_dim=args.embedding_size,
+                    device=args.device)
+    elif args.model_name == 'stem':
+        model = STEM(categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=args.embedding_size,
+                    device=args.device)
     # writer.add_graph(model, next(train_dataloader))
     # print(model)
     model.fit(model, train_dataloader, val_dataloader, test_dataloader, args, le, train=False)
