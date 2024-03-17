@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from model.layers.inputs import varlen_embedding_lookup, get_varlen_pooling_list, stem_varlen_embedding_lookup, \
     stem_get_varlen_pooling_list
+from ..layers.attention import SelfAttentionModule
 from ..layers.core import DNN, PredictionLayer
 from sklearn.metrics import roc_auc_score
 save_data_path = './dataset/data/save/'
@@ -115,12 +116,12 @@ class STEM_Layer(nn.Module):
         else:
             return stem_outputs
 
-class STEM(nn.Module):
-    def __init__(self, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=128,
+class STEMASD(nn.Module):
+    def __init__(self, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, writer, emb_dim=128,
                  expert_dnn_hidden_units=(256, 128), num_shared_experts=1, num_specific_experts=1, num_layers=2,
                  gate_dnn_hidden_units=(64,), tower_dnn_hidden_units=(64,),
                  l2_reg_embedding=0.00001, l2_reg_dnn=0,
-                 init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu', dnn_use_bn=False,
+                 init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu', dnn_use_bn=True,
                  device='cpu', gpus=None):
         """
         MMOE model input parameters
@@ -135,7 +136,7 @@ class STEM(nn.Module):
         :param expert_activation: activation function like 'relu' or 'sigmoid'
         :param num_task: int default 2 multitask numbers
         """
-        super(STEM, self).__init__()
+        super(STEMASD, self).__init__()
         torch.manual_seed(seed)
         self.regularization_weight = []
         if gpus and str(self.gpus[0]) not in self.device:
@@ -154,11 +155,13 @@ class STEM(nn.Module):
         self.categorical_feature_dict = categorical_feature_dict
         self.continuous_feature_dict = continuous_feature_dict
         self.var_cat_feature_dict = var_cat_feature_dict
+        self.user_features = user_features
         self.num_tasks = len(labels)
         self.writer = writer
         self.labels = labels
         self.task_types = ['binary']*self.num_tasks
         self.embedding_dim = emb_dim
+        self.eps = torch.FloatTensor([1e-8]).to(device)
         # TODO
         self.loss_function = [F.binary_cross_entropy]*self.num_tasks
         # print(len(self.categorical_feature_dict), len(self.continuous_feature_dict), len(self.history_feature_dict))
@@ -180,7 +183,9 @@ class STEM(nn.Module):
 
         # user embedding + item embedding
         self.input_dim = emb_dim * (len(self.categorical_feature_dict) + len(self.var_cat_feature_dict)) + len(continuous_feature_dict)
-
+        self.user_cat_feature_len = len(set(self.categorical_feature_dict.keys()) & set(self.user_features))
+        self.user_input_dim = emb_dim * (self.user_cat_feature_len + len(self.var_cat_feature_dict)) + 1#  + len(self.user_features) - self.user_cat_feature_len + 1
+        # 1. expert + gate
         self.stem_layers = nn.ModuleList([STEM_Layer(num_shared_experts, num_specific_experts, self.num_tasks,
                                                      input_dim= self.input_dim if i==0 else expert_dnn_hidden_units[-1],
                                                      expert_hidden_units= expert_dnn_hidden_units,
@@ -191,6 +196,7 @@ class STEM(nn.Module):
                                                      dnn_use_bn=dnn_use_bn,
                                                      init_std=init_std,
                                                      device=device) for i in range(self.num_layers)])
+        # 2. 任务塔
         self.tower = nn.ModuleList([DNN(expert_dnn_hidden_units[-1], tower_dnn_hidden_units, activation=dnn_activation,
                                         l2_reg=l2_reg_dnn,
                                         dropout_rate=dnn_dropout,
@@ -198,24 +204,55 @@ class STEM(nn.Module):
                                         init_std=init_std,
                                         device=device)
                                     for _ in range(self.num_tasks)])
-        self.output_activation = nn.ModuleList([self.get_output_activation(self.task_types[i]) for i in range(self.num_tasks)])
+        # 直接默认塔网络有多层
+        self.self_attention = SelfAttentionModule(tower_dnn_hidden_units[-1], self.num_tasks)
+        self.tower_dnn_final_layer = nn.ModuleList([nn.Linear(tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1, bias=False)
+                                                    for _ in range(self.num_tasks)])
+        # 3. user tower (task-specific)
+        self.user_tower_dnn = nn.ModuleList(
+            [DNN(self.user_input_dim, tower_dnn_hidden_units, activation=dnn_activation,
+                 l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
+                 init_std=init_std, device=device) for _ in range(self.num_tasks)])
+        self.user_tower_dnn_final_layer = nn.ModuleList([nn.Linear(
+            tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
+            bias=False) for _ in range(self.num_tasks)])
 
-        regularization_modules = [self.stem_layers, self.tower]
+        # 4. 输出经过激活函数
+        self.output_activation = nn.ModuleList([self.get_output_activation(self.task_types[i]) for i in range(self.num_tasks)])
+        self.user_out = nn.ModuleList([self.get_output_activation(self.task_types[i]) for i in range(self.num_tasks)])
+
+        regularization_modules = [self.stem_layers, self.tower, self.tower_dnn_final_layer, self.user_tower_dnn, self.user_tower_dnn_final_layer]
         for module in regularization_modules:
             self.add_regularization_weight(
                 filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], module.named_parameters()), l2=l2_reg_dnn)
+        # self.reset_parameters()
         self.to(device)
 
+    def reset_parameters(self):
+        def reset_default_params(m):
+            # initialize nn.Linear/nn.Conv1d layers by default
+            if type(m) in [nn.Linear, nn.Conv1d]:
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0)
+        def reset_custom_params(m):
+            # initialize layers with customized reset_parameters
+            if hasattr(m, 'reset_custom_params'):
+                m.reset_custom_params()
+        self.apply(reset_default_params)
+        self.apply(reset_custom_params)
 
     def forward(self, x):
         # assert x.size()[1] == len(self.categorical_feature_dict) + len(self.continuous_feature_dict) + len(self.var_cat_feature_dict)*20+1
         # embedding
-        cat_embed_list, con_embed_list = [[] for _ in range(self.num_tasks+1)], list()
+        cat_embed_list, con_embed_list, user_cat_embed_list = [[] for _ in range(self.num_tasks+1)], list(), [[] for _ in range(self.num_tasks+1)]
         for cat_feature, num in self.categorical_feature_dict.items():
             cat_emb = self.embedding_dict[cat_feature](x[:, num[1]].long())
             feature_embs = cat_emb.split(self.embedding_dim, dim=1)
             for i in range(self.num_tasks+1):
                 cat_embed_list[i].append(feature_embs[i])
+                if cat_feature in self.user_features:
+                    user_cat_embed_list[i].append(feature_embs[i])
 
 
         for con_feature, num in self.continuous_feature_dict.items():
@@ -229,16 +266,40 @@ class STEM(nn.Module):
         con_embed = torch.cat(con_embed_list, axis=1)
         varelen_embed = [torch.cat(varlen_embed_list[i], axis=1) for i in range(self.num_tasks+1)]
 
+        # 用户辅助网络 embedding concat
+        user_cat_embed = [torch.cat(user_cat_embed_list[i], axis=1) for i in range(self.num_tasks+1)]
+
         # hidden layer
         dnn_input = [torch.cat([cat_embed[i], con_embed, varelen_embed[i]], axis=1).float() for i in range(self.num_tasks+1)]  # batch * hidden_size
+        user_dnn_input = [torch.cat([user_cat_embed[i], varelen_embed[i]], axis=1).float() for i in range(self.num_tasks+1)]
 
         for i in range(self.num_layers):
             stem_outputs = self.stem_layers[i](dnn_input)
             dnn_input = stem_outputs
-        tower_output = [self.tower[i](stem_outputs[i]) for i in range(self.num_tasks)]
-        y_pred = [self.output_activation[i](tower_output[i]) for i in range(self.num_tasks)]
-        y_pred = torch.cat(y_pred, -1)
-        return y_pred
+        user_weights = []
+        for i, label in enumerate(self.labels):
+            # 计算当前任务辅助网络输入
+            emp_label = x[:, self.continuous_feature_dict['emp_'+label][1]].unsqueeze(1)# .detach()
+            curr_user_dnn_input = torch.cat([user_dnn_input[i], emp_label], axis=1).float()
+            user_tower_dnn_out = self.user_tower_dnn[i](curr_user_dnn_input)
+            user_tower_dnn_logit = self.user_tower_dnn_final_layer[i](user_tower_dnn_out)
+            # user辅助塔结果处理
+            user_output = self.user_out[i](user_tower_dnn_logit)
+            user_weights.append(user_output)
+
+        task_dnn_outs = [self.tower[i](stem_outputs[i]) for i in range(self.num_tasks)]
+        attention_input = torch.stack(task_dnn_outs, dim=1)
+        attention_output = self.self_attention(attention_input)
+        task_final_layer_input = torch.split(attention_output + attention_input, 1, dim=1)
+        task_outs = []
+        for i, label in enumerate(self.labels):
+            tower_dnn_logit = self.tower_dnn_final_layer[i](task_final_layer_input[i].squeeze(1))
+            # 主塔结果处理
+            output = self.output_activation[i](tower_dnn_logit)
+            task_outs.append(output)
+        task_outs = torch.cat(task_outs, -1)
+        user_weights = torch.cat(user_weights, -1)
+        return task_outs, user_weights
 
     def add_regularization_weight(self, weight_list, l1=0.0, l2=0.0):
         # For a Parameter, put it in a list to keep Compatible with get_regularization_loss()
@@ -269,16 +330,28 @@ class STEM(nn.Module):
             total_loss, count = 0, 0
             for idx, (x, y) in tqdm(enumerate(train_loader)):
                 x, y= x.to(device), y.to(device)
-                predict = model(x)
+                predict, user_weight = model(x)
+                # user weights处理
+                if idx == 0:
+                    user_avg_weight_in_batch = torch.mean(user_weight, dim=0).detach()
+                else:
+                    user_avg_weight_in_batch = user_avg_weight_in_batch * 0.9 + 0.1 * torch.mean(user_weight,
+                                                                                                 dim=0).detach()
+                user_loss_weight = torch.where(y == 0,
+                                               torch.tanh(torch.div((1 - user_avg_weight_in_batch),
+                                                                    (1 - user_weight) + self.eps)),
+                                               torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
+                loss_weight = user_loss_weight
+                loss_weight_easy = [1, 1, 1, 10, 10, 10]
+                # 计算loss
+                loss = sum(
+                    [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none'))*loss_weight_easy[i] for i in range(self.num_tasks)])
+                reg_loss = self.get_regularization_loss()
+                curr_loss = loss + reg_loss
+                self.writer.add_scalar("train_loss", float(curr_loss), idx)
                 for i, l in enumerate(self.labels):
                     y_train_true[l] += list(y[:, i].cpu().numpy())
                     y_train_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                loss_weight = [1, 1, 1, 1, 1, 1]
-                loss = sum(
-                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
-                reg_loss = self.get_regularization_loss()
-                curr_loss = loss + reg_loss
-                self.writer.add_scalar("train_loss", curr_loss.detach().mean(), idx)
                 optimizer.zero_grad()
                 curr_loss.backward()
                 optimizer.step()
@@ -297,24 +370,24 @@ class STEM(nn.Module):
             save_message = []
             for idx, (x, y) in enumerate(val_loader):
                 x, y = x.to(device), y.to(device)
-                predict = model(x)
+                predict, user_weight = model(x)
                 for i, l in enumerate(self.labels):
-                    y_val_true[l] += list(y[:,i].cpu().numpy())
+                    y_val_true[l] += list(y[:, i].cpu().numpy())
                     y_val_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                val_x = x.cpu().numpy()
-                val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
-                val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
-                save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
+                # user weights处理
+                user_loss_weight = torch.where(y == 0,
+                                               torch.tanh(torch.div((1 - user_avg_weight_in_batch),
+                                                                    (1 - user_weight) + self.eps)),
+                                               torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
+                loss_weight = user_loss_weight
+                loss_weight_easy = [1, 1, 1, 1, 10, 10]
                 loss = sum(
-                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
+                    [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none'))*loss_weight_easy[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
                 curr_loss = loss + reg_loss
                 self.writer.add_scalar("val_loss", curr_loss.detach().mean(), idx)
                 total_eval_loss += float(curr_loss)
                 count_eval += 1
-            final_save_message = np.concatenate(save_message, axis=0)
-            val_df = pd.DataFrame(final_save_message)
-            val_df.to_csv(save_data_path+'val_predict_data.csv', index=False)
             auc = dict()
             for l in self.labels:
                 auc[l] = roc_auc_score(y_val_true[l], y_val_predict[l])
@@ -346,16 +419,26 @@ class STEM(nn.Module):
         y_test_predict = collections.defaultdict(list)
         for idx, (x, y) in enumerate(test_loader):
             x, y = x.to(device), y.to(device)
-            predict = model(x)
+            predict, user_weight = model(x)
             for i, l in enumerate(self.labels):
                 y_test_true[l] += list(y[:, i].cpu().numpy())
                 y_test_predict[l] += list(predict[:, i].cpu().detach().numpy())
+            # user weights处理
+            user_loss_weight = torch.where(y == 0,
+                                           torch.tanh(
+                                               torch.div((1 - user_avg_weight_in_batch), (1 - user_weight) + self.eps)),
+                                           torch.tanh(torch.div(user_avg_weight_in_batch, user_weight + self.eps)))
+            loss_weight = user_loss_weight
+            # user_id转换
             test_x = x.cpu().numpy()
             test_x[:, 0] = le['user_id'].inverse_transform(test_x[:, 0].astype(int))
-            # test_x[:, 27] = le['video_id'].inverse_transform(test_x[:, 27].astype(int))
-            save_message.append(np.concatenate([test_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
+            test_x[:, 27] = le['video_id'].inverse_transform(test_x[:, 27].astype(int))
+            save_message.append(np.concatenate(
+                [test_x, y.cpu().numpy(), predict.cpu().detach().numpy(), user_loss_weight.detach().numpy()], axis=1))
+            # loss计算
             loss = sum(
-                [self.loss_function[i](predict[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
+                [torch.matmul(loss_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none')) for
+                 i in range(self.num_tasks)])
             reg_loss = self.get_regularization_loss()
             curr_loss = loss + reg_loss
             self.writer.add_scalar("test_loss", curr_loss.detach().mean(), idx)
@@ -363,11 +446,11 @@ class STEM(nn.Module):
             count_test += 1
         final_save_message = np.concatenate(save_message, axis=0)
         test_df = pd.DataFrame(final_save_message)
-        test_df.to_csv(save_data_path+'test_predict_data_stem_asd.csv', index=False)
+        test_df.to_csv(save_data_path+'test_predict_data_stemasd.csv', index=False)
         auc = dict()
         for l in self.labels:
             auc[l] = roc_auc_score(y_test_true[l], y_test_predict[l])
-            print("test loss is %.3f, %s auc is %.3f" % (total_test_loss / count_test, l, auc[l]))
+            print("Epoch %d test loss is %.3f, %s auc is %.3f" % (e + 1, total_test_loss / count_test, l, auc[l]))
 
     def get_regularization_loss(self, ):
         total_reg_loss = torch.zeros((1,), device=self.device)

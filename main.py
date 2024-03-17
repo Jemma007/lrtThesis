@@ -58,10 +58,10 @@ if __name__ == "__main__":
     parser.add_argument('--save_path', type=str, default='./checkpoint/')
 
     parser.add_argument('--model_name', default='mmoe')
-    parser.add_argument('--embedding_size', type=int, default=128)
-    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--embedding_size', type=int, default=18)
+    parser.add_argument('--epochs', type=int, default=3)
 
-    parser.add_argument('--lr', type=float, default=0.0005)
+    parser.add_argument('--lr', type=float, default=0.001)
 
     parser.add_argument('--device', default='cpu')  # cuda:0
     parser.add_argument('--is_parallel', type=bool, default=False)

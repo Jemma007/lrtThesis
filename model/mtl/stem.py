@@ -120,7 +120,7 @@ class STEM(nn.Module):
                  expert_dnn_hidden_units=(256, 128), num_shared_experts=1, num_specific_experts=1, num_layers=2,
                  gate_dnn_hidden_units=(64,), tower_dnn_hidden_units=(64,),
                  l2_reg_embedding=0.00001, l2_reg_dnn=0,
-                 init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu', dnn_use_bn=False,
+                 init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu', dnn_use_bn=True,
                  device='cpu', gpus=None):
         """
         MMOE model input parameters
@@ -198,14 +198,30 @@ class STEM(nn.Module):
                                         init_std=init_std,
                                         device=device)
                                     for _ in range(self.num_tasks)])
+        self.tower_dnn_final_layer = nn.ModuleList([nn.Linear(tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1, bias=False)
+                                                    for _ in range(self.num_tasks)])
         self.output_activation = nn.ModuleList([self.get_output_activation(self.task_types[i]) for i in range(self.num_tasks)])
 
-        regularization_modules = [self.stem_layers, self.tower]
+        regularization_modules = [self.stem_layers, self.tower, self.tower_dnn_final_layer]
         for module in regularization_modules:
             self.add_regularization_weight(
                 filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], module.named_parameters()), l2=l2_reg_dnn)
+        # self.reset_parameters()
         self.to(device)
 
+    def reset_parameters(self):
+        def reset_default_params(m):
+            # initialize nn.Linear/nn.Conv1d layers by default
+            if type(m) in [nn.Linear, nn.Conv1d]:
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0)
+        def reset_custom_params(m):
+            # initialize layers with customized reset_parameters
+            if hasattr(m, 'reset_custom_params'):
+                m.reset_custom_params()
+        self.apply(reset_default_params)
+        self.apply(reset_custom_params)
 
     def forward(self, x):
         # assert x.size()[1] == len(self.categorical_feature_dict) + len(self.continuous_feature_dict) + len(self.var_cat_feature_dict)*20+1
@@ -235,7 +251,7 @@ class STEM(nn.Module):
         for i in range(self.num_layers):
             stem_outputs = self.stem_layers[i](dnn_input)
             dnn_input = stem_outputs
-        tower_output = [self.tower[i](stem_outputs[i]) for i in range(self.num_tasks)]
+        tower_output = [self.tower_dnn_final_layer[i](self.tower[i](stem_outputs[i])) for i in range(self.num_tasks)]
         y_pred = [self.output_activation[i](tower_output[i]) for i in range(self.num_tasks)]
         y_pred = torch.cat(y_pred, -1)
         return y_pred
@@ -273,7 +289,7 @@ class STEM(nn.Module):
                 for i, l in enumerate(self.labels):
                     y_train_true[l] += list(y[:, i].cpu().numpy())
                     y_train_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                loss_weight = [1, 1, 1, 1, 1, 1]
+                loss_weight = [1, 1, 1, 10, 10, 10]
                 loss = sum(
                     [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()

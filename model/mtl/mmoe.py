@@ -216,7 +216,7 @@ class MMOE(nn.Module):
                 for i, l in enumerate(self.labels):
                     y_train_true[l] += list(y[:, i].cpu().numpy())
                     y_train_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                loss_weight = [1, 1, 1, 10, 10, 10]
+                loss_weight = [1, 1, 1, 1, 1, 10]
                 loss = sum(
                     [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
@@ -248,7 +248,6 @@ class MMOE(nn.Module):
                 val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
                 val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
                 save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
-                loss_weight = [1, 1, 1, 10, 10, 10]
                 loss = sum(
                     [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
@@ -299,7 +298,7 @@ class MMOE(nn.Module):
             # test_x[:, 27] = le['video_id'].inverse_transform(test_x[:, 27].astype(int))
             save_message.append(np.concatenate([test_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
             loss = sum(
-                [self.loss_function[i](predict[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
+                [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
             reg_loss = self.get_regularization_loss()
             curr_loss = loss + reg_loss
             self.writer.add_scalar("test_loss", curr_loss.detach().mean(), idx)
