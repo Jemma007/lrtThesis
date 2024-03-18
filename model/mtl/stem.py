@@ -289,7 +289,7 @@ class STEM(nn.Module):
                 for i, l in enumerate(self.labels):
                     y_train_true[l] += list(y[:, i].cpu().numpy())
                     y_train_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                loss_weight = [1, 1, 1, 10, 10, 10]
+                loss_weight = [1, 1, 1, 10, 10, 30]
                 loss = sum(
                     [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()

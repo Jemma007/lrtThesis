@@ -7,6 +7,7 @@ Reference:
 '''
 import collections
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -16,19 +17,20 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from model.layers.inputs import varlen_embedding_lookup, get_varlen_pooling_list
+from ..layers.attention import SelfAttentionModule
 from ..layers.core import DNN, PredictionLayer
 from sklearn.metrics import roc_auc_score
 save_data_path = './dataset/data/save/'
 
 
-class PLE(nn.Module):
+class MMOEWET(nn.Module):
     """
     MMOE for CTCVR problem
     """
 
-    def __init__(self, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, labels, writer, emb_dim=128,
-                 num_levels=2, specific_expert_num=1, shared_expert_num=1, expert_dnn_hidden_units=(256, 128),
-                 gate_dnn_hidden_units=(64,), tower_dnn_hidden_units=(64,),
+    def __init__(self, categorical_feature_dict, continuous_feature_dict, var_cat_feature_dict, user_features, labels, writer, emb_dim=128,
+                 num_experts=3, expert_dnn_hidden_units=(256, 128),
+                 gate_dnn_hidden_units=(64,), tower_dnn_hidden_units=(64,), user_tower_dnn_hidden_units=(256, 128, 64,),
                  l2_reg_embedding=0.00001, l2_reg_dnn=0,
                  init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu', dnn_use_bn=True,
                  device='cpu', gpus=None):
@@ -45,7 +47,7 @@ class PLE(nn.Module):
         :param expert_activation: activation function like 'relu' or 'sigmoid'
         :param num_task: int default 2 multitask numbers
         """
-        super(PLE, self).__init__()
+        super(MMOEWET, self).__init__()
         torch.manual_seed(seed)
         self.regularization_weight = []
         if gpus and str(self.gpus[0]) not in self.device:
@@ -60,16 +62,17 @@ class PLE(nn.Module):
         self.gate_dnn_hidden_units = gate_dnn_hidden_units
         self.expert_dnn_hidden_units = expert_dnn_hidden_units
         self.tower_dnn_hidden_units = tower_dnn_hidden_units
+        self.user_dnn_hidden_units = user_tower_dnn_hidden_units
         self.categorical_feature_dict = categorical_feature_dict
         self.continuous_feature_dict = continuous_feature_dict
         self.var_cat_feature_dict = var_cat_feature_dict
+        self.user_features = user_features
         self.num_tasks = len(labels)
-        self.specific_expert_num = specific_expert_num
-        self.shared_expert_num = shared_expert_num
-        self.num_levels = num_levels
+        self.num_experts = num_experts
         self.writer = writer
         self.labels = labels
         self.task_types = ['binary']*self.num_tasks
+        self.eps = torch.FloatTensor([1e-8]).to(device)
         # TODO
         self.loss_function = [F.binary_cross_entropy]*self.num_tasks
         # print(len(self.categorical_feature_dict), len(self.continuous_feature_dict), len(self.history_feature_dict))
@@ -91,59 +94,27 @@ class PLE(nn.Module):
 
         # user embedding + item embedding
         self.input_dim = emb_dim * (len(self.categorical_feature_dict) + len(self.var_cat_feature_dict)) + len(continuous_feature_dict)
+        self.user_cat_feature_len = len(set(self.categorical_feature_dict.keys()) & set(self.user_features))
+        self.user_input_dim = emb_dim * (self.user_cat_feature_len + len(self.var_cat_feature_dict)) + 1#  + len(self.user_features) - self.user_cat_feature_len + 1
 
-        def multi_module_list(num_level, num_tasks, expert_num, inputs_dim_level0, inputs_dim_not_level0, hidden_units):
-            return nn.ModuleList(
-                [nn.ModuleList([nn.ModuleList([DNN(inputs_dim_level0 if level_num == 0 else inputs_dim_not_level0,
-                                                   hidden_units, activation=dnn_activation,
-                                                   l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
-                                                   init_std=init_std, device=device) for _ in
-                                               range(expert_num)])
-                                for _ in range(num_tasks)]) for level_num in range(num_level)])
+        # expert dnn
+        self.expert_dnn = nn.ModuleList([DNN(self.input_dim, self.expert_dnn_hidden_units, activation=dnn_activation,
+                                             l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
+                                             init_std=init_std, device=device) for _ in range(self.num_experts)])
 
-        # 1. experts
-        # task-specific experts
-        self.specific_experts = multi_module_list(self.num_levels, self.num_tasks, self.specific_expert_num,
-                                                  self.input_dim, expert_dnn_hidden_units[-1], expert_dnn_hidden_units)
-
-        # shared experts
-        self.shared_experts = multi_module_list(self.num_levels, 1, self.specific_expert_num,
-                                                self.input_dim, expert_dnn_hidden_units[-1], expert_dnn_hidden_units)
-
-        # 2. gates
-        # gates for task-specific experts
-        specific_gate_output_dim = self.specific_expert_num + self.shared_expert_num
+        # gate dnn
         if len(gate_dnn_hidden_units) > 0:
-            self.specific_gate_dnn = multi_module_list(self.num_levels, self.num_tasks, 1,
-                                                       self.input_dim, expert_dnn_hidden_units[-1],
-                                                       gate_dnn_hidden_units)
+            self.gate_dnn = nn.ModuleList([DNN(self.input_dim, gate_dnn_hidden_units, activation=dnn_activation,
+                                               l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
+                                               init_std=init_std, device=device) for _ in range(self.num_tasks)])
             self.add_regularization_weight(
-                filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.specific_gate_dnn.named_parameters()),
+                filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.gate_dnn.named_parameters()),
                 l2=l2_reg_dnn)
-        self.specific_gate_dnn_final_layer = nn.ModuleList(
-            [nn.ModuleList([nn.Linear(
-                gate_dnn_hidden_units[-1] if len(gate_dnn_hidden_units) > 0 else self.input_dim if level_num == 0 else
-                expert_dnn_hidden_units[-1], specific_gate_output_dim, bias=False)
-                for _ in range(self.num_tasks)]) for level_num in range(self.num_levels)])
+        self.gate_dnn_final_layer = nn.ModuleList(
+            [nn.Linear(gate_dnn_hidden_units[-1] if len(gate_dnn_hidden_units) > 0 else self.input_dim,
+                       self.num_experts, bias=False) for _ in range(self.num_tasks)])
 
-        # gates for shared experts
-        shared_gate_output_dim = self.num_tasks * self.specific_expert_num + self.shared_expert_num
-        if len(gate_dnn_hidden_units) > 0:
-            self.shared_gate_dnn = nn.ModuleList([DNN(self.input_dim if level_num == 0 else expert_dnn_hidden_units[-1],
-                                                      gate_dnn_hidden_units, activation=dnn_activation,
-                                                      l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
-                                                      init_std=init_std, device=device) for level_num in
-                                                  range(self.num_levels)])
-            self.add_regularization_weight(
-                filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.shared_gate_dnn.named_parameters()),
-                l2=l2_reg_dnn)
-        self.shared_gate_dnn_final_layer = nn.ModuleList(
-            [nn.Linear(
-                gate_dnn_hidden_units[-1] if len(gate_dnn_hidden_units) > 0 else self.input_dim if level_num == 0 else
-                expert_dnn_hidden_units[-1], shared_gate_output_dim, bias=False)
-                for level_num in range(self.num_levels)])
-
-        # 3. tower dnn (task-specific)
+        # tower dnn (task-specific)
         if len(tower_dnn_hidden_units) > 0:
             self.tower_dnn = nn.ModuleList(
                 [DNN(expert_dnn_hidden_units[-1], tower_dnn_hidden_units, activation=dnn_activation,
@@ -152,111 +123,127 @@ class PLE(nn.Module):
             self.add_regularization_weight(
                 filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.tower_dnn.named_parameters()),
                 l2=l2_reg_dnn)
+        # 直接默认塔网络有多层
+        self.self_attention = SelfAttentionModule(tower_dnn_hidden_units[-1], self.num_tasks)
         self.tower_dnn_final_layer = nn.ModuleList([nn.Linear(
             tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
-            bias=False)
-            for _ in range(self.num_tasks)])
+            bias=False) for _ in range(self.num_tasks)])
 
-        self.out = nn.ModuleList([PredictionLayer(task) for task in self.task_types])
+        # user tower
+        self.user_tower_dnn = nn.ModuleList(
+            [DNN(self.user_input_dim, user_tower_dnn_hidden_units, activation=dnn_activation,
+                 l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
+                 init_std=init_std, device=device) for _ in range(self.num_tasks)])
+        self.add_regularization_weight(
+            filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.user_tower_dnn.named_parameters()),
+            l2=l2_reg_dnn)
+        self.user_tower_dnn_final_layer = nn.ModuleList([nn.Linear(
+            user_tower_dnn_hidden_units[-1] if len(user_tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
+            bias=False) for _ in range(self.num_tasks)])
 
-        regularization_modules = [self.specific_experts, self.shared_experts, self.specific_gate_dnn_final_layer,
-                                  self.shared_gate_dnn_final_layer, self.tower_dnn_final_layer]
+        # # item tower
+        # self.item_tower_dnn = nn.ModuleList(
+        #     [DNN(self.item_input_dim, tower_dnn_hidden_units, activation=dnn_activation,
+        #          l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
+        #          init_std=init_std, device=device) for _ in range(self.num_tasks)])
+        # self.add_regularization_weight(
+        #     filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.item_tower_dnn.named_parameters()),
+        #     l2=l2_reg_dnn)
+        # self.item_tower_dnn_final_layer = nn.ModuleList([nn.Linear(
+        #     tower_dnn_hidden_units[-1] if len(tower_dnn_hidden_units) > 0 else expert_dnn_hidden_units[-1], 1,
+        #     bias=False) for _ in range(self.num_tasks)])
+
+
+        regularization_modules = [self.expert_dnn, self.gate_dnn_final_layer, self.tower_dnn_final_layer, self.user_tower_dnn_final_layer]# , self.item_tower_dnn_final_layer]
         for module in regularization_modules:
             self.add_regularization_weight(
                 filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], module.named_parameters()), l2=l2_reg_dnn)
         self.to(device)
 
-    # a single cgc Layer
-    def cgc_net(self, inputs, level_num):
-        # inputs: [task1, task2, ... taskn, shared task]
-
-        # 1. experts
-        # task-specific experts
-        specific_expert_outputs = []
-        for i in range(self.num_tasks):
-            for j in range(self.specific_expert_num):
-                specific_expert_output = self.specific_experts[level_num][i][j](inputs[i])
-                specific_expert_outputs.append(specific_expert_output)
-
-        # shared experts
-        shared_expert_outputs = []
-        for k in range(self.shared_expert_num):
-            shared_expert_output = self.shared_experts[level_num][0][k](inputs[-1])
-            shared_expert_outputs.append(shared_expert_output)
-
-        # 2. gates
-        # gates for task-specific experts
-        cgc_outs = []
-        for i in range(self.num_tasks):
-            # concat task-specific expert and task-shared expert
-            cur_experts_outputs = specific_expert_outputs[
-                                  i * self.specific_expert_num:(i + 1) * self.specific_expert_num] + shared_expert_outputs
-            cur_experts_outputs = torch.stack(cur_experts_outputs, 1)
-
-            # gate dnn
-            if len(self.gate_dnn_hidden_units) > 0:
-                gate_dnn_out = self.specific_gate_dnn[level_num][i][0](inputs[i])
-                gate_dnn_out = self.specific_gate_dnn_final_layer[level_num][i](gate_dnn_out)
-            else:
-                gate_dnn_out = self.specific_gate_dnn_final_layer[level_num][i](inputs[i])
-            gate_mul_expert = torch.matmul(gate_dnn_out.softmax(1).unsqueeze(1), cur_experts_outputs)  # (bs, 1, dim)
-            cgc_outs.append(gate_mul_expert.squeeze())
-
-        # gates for shared experts
-        cur_experts_outputs = specific_expert_outputs + shared_expert_outputs
-        cur_experts_outputs = torch.stack(cur_experts_outputs, 1)
-
-        if len(self.gate_dnn_hidden_units) > 0:
-            gate_dnn_out = self.shared_gate_dnn[level_num](inputs[-1])
-            gate_dnn_out = self.shared_gate_dnn_final_layer[level_num](gate_dnn_out)
-        else:
-            gate_dnn_out = self.shared_gate_dnn_final_layer[level_num](inputs[-1])
-        gate_mul_expert = torch.matmul(gate_dnn_out.softmax(1).unsqueeze(1), cur_experts_outputs)  # (bs, 1, dim)
-        cgc_outs.append(gate_mul_expert.squeeze())
-
-        return cgc_outs
+        self.out = nn.ModuleList([PredictionLayer(task) for task in self.task_types])
+        self.user_out = nn.ModuleList([PredictionLayer(task) for task in self.task_types])
+        # self.item_out = nn.ModuleList([PredictionLayer(task) for task in self.task_types])
 
 
     def forward(self, x):
-        # assert x.size()[1] == len(self.categorical_feature_dict) + len(self.continuous_feature_dict) + len(self.var_cat_feature_dict)*20+1
+        # assert x.size()[1] == len(self.categorical_feature_dict) + len(self.continuous_feature_dict)
         # embedding
-        cat_embed_list, con_embed_list = list(), list()
+        cat_embed_list, con_embed_list, user_cat_embed_list = list(), list(), list()
         for cat_feature, num in self.categorical_feature_dict.items():
             cat_embed_list.append(self.embedding_dict[cat_feature](x[:, num[1]].long()))
+            if cat_feature in self.user_features:
+                user_cat_embed = self.embedding_dict[cat_feature](x[:, num[1]].long()).detach()
+                user_cat_embed_list.append(user_cat_embed)
 
         for con_feature, num in self.continuous_feature_dict.items():
             con_embed_list.append(x[:, num[1]].unsqueeze(1))
+            # if con_feature in self.user_features:
+                # user_con_embed = x[:, num[1]].unsqueeze(1).detach()
+                # user_con_embed_list.append(user_con_embed)
 
         sequence_embed_dict = varlen_embedding_lookup(x, self.embedding_dict, self.var_cat_feature_dict)
         varlen_embed_list = get_varlen_pooling_list(sequence_embed_dict, x, self.var_cat_feature_dict, self.device)
 
-        # embedding 融合
+        # embedding concat
         cat_embed = torch.cat(cat_embed_list, axis=1)
         con_embed = torch.cat(con_embed_list, axis=1)
         varelen_embed = torch.cat(varlen_embed_list, axis=1)
 
+        # 用户辅助网络 embedding concat
+        user_cat_embed = torch.cat(user_cat_embed_list, axis=1)
+
         # hidden layer
         dnn_input = torch.cat([cat_embed, con_embed, varelen_embed], axis=1).float()  # batch * hidden_size
+        user_dnn_input = torch.cat([user_cat_embed, varelen_embed], axis=1).float()
 
-        # repeat `dnn_input` for several times to generate cgc input
-        ple_inputs = [dnn_input] * (self.num_tasks + 1)  # [task1, task2, ... taskn, shared task]
-        ple_outputs = []
-        for i in range(self.num_levels):
-            ple_outputs = self.cgc_net(inputs=ple_inputs, level_num=i)
-            ple_inputs = ple_outputs
+        # expert dnn
+        expert_outs = []
+        for i in range(self.num_experts):
+            expert_out = self.expert_dnn[i](dnn_input)
+            expert_outs.append(expert_out)
+        expert_outs = torch.stack(expert_outs, 1)  # (bs, num_experts, dim)
+        # print(expert_outs.shape)
+        # print(expert_outs)
+        # gate dnn
+        mmoe_outs = []
+        for i in range(self.num_tasks):
+            if len(self.gate_dnn_hidden_units) > 0:
+                gate_dnn_out = self.gate_dnn[i](dnn_input)
+                gate_dnn_out = self.gate_dnn_final_layer[i](gate_dnn_out)
+            else:
+                gate_dnn_out = self.gate_dnn_final_layer[i](dnn_input)
+            gate_mul_expert = torch.matmul(gate_dnn_out.softmax(1).unsqueeze(1), expert_outs)  # (bs, 1, dim)
+            mmoe_outs.append(gate_mul_expert.squeeze())
 
         # tower dnn (task-specific)
+        task_dnn_outs, user_weights = [], []
+        for i, label in enumerate(self.labels):
+            tower_dnn_out = self.tower_dnn[i](mmoe_outs[i])
+            task_dnn_outs.append(tower_dnn_out)
+            # 计算当前任务辅助网络输入
+            emp_label = x[:, self.continuous_feature_dict['emp_'+label][1]].unsqueeze(1)# .detach()
+            curr_user_dnn_input = torch.cat([user_dnn_input, emp_label], axis=1).float()
+            user_tower_dnn_out = self.user_tower_dnn[i](curr_user_dnn_input)
+            # item_tower_dnn_out = self.item_tower_dnn[i](item_dnn_input)
+            user_tower_dnn_logit = self.user_tower_dnn_final_layer[i](user_tower_dnn_out)
+            # user辅助塔结果处理
+            user_output = self.user_out[i](user_tower_dnn_logit)
+            user_weights.append(user_output)
+
+        attention_input = torch.stack(task_dnn_outs, dim=1)
+        attention_output = self.self_attention(attention_input)
+        task_final_layer_input = torch.split(attention_output + attention_input, 1, dim=1)
         task_outs = []
-        for i in range(self.num_tasks):
-            if len(self.tower_dnn_hidden_units) > 0:
-                tower_dnn_out = self.tower_dnn[i](ple_outputs[i])
-                tower_dnn_logit = self.tower_dnn_final_layer[i](tower_dnn_out)
-            else:
-                tower_dnn_logit = self.tower_dnn_final_layer[i](ple_outputs[i])
+        for i, label in enumerate(self.labels):
+            tower_dnn_logit = self.tower_dnn_final_layer[i](task_final_layer_input[i].squeeze(1))
+            # 主塔结果处理
             output = self.out[i](tower_dnn_logit)
             task_outs.append(output)
+
         task_outs = torch.cat(task_outs, -1)
-        return task_outs
+        user_weights = torch.cat(user_weights, -1) # (batch size, num_tasks)
+        # item_weight = torch.cat(item_weights, -1)
+        return task_outs, user_weights# , item_weight
     def add_regularization_weight(self, weight_list, l1=0.0, l2=0.0):
         # For a Parameter, put it in a list to keep Compatible with get_regularization_loss()
         if isinstance(weight_list, torch.nn.parameter.Parameter):
@@ -283,56 +270,60 @@ class PLE(nn.Module):
         for e in range(epoch):
             y_train_true = collections.defaultdict(list)
             y_train_predict = collections.defaultdict(list)
-            total_loss, count = 0, 0
+            total_loss, count_train = 0, 0
             for idx, (x, y) in tqdm(enumerate(train_loader)):
                 x, y= x.to(device), y.to(device)
-                predict = model(x)
+                batch_size = x.shape[0]
+                # predict, user_weight, item_weight = model(x)
+                predict, u_weight = model(x)
+                user_weight = u_weight.detach()
+                loss_weight_easy = [1, 1, 1, 5, 5, 10]
+                # 计算loss
+                main_loss = sum(
+                    [torch.matmul(user_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none'))
+                     *loss_weight_easy[i] for i in range(self.num_tasks)])
+                reg_loss = self.get_regularization_loss()
+                aux_loss = sum(
+                    [self.loss_function[i](u_weight[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
+                curr_loss = main_loss + aux_loss + reg_loss
+                self.writer.add_scalar("train_loss", float(curr_loss)/batch_size, idx)
                 for i, l in enumerate(self.labels):
                     y_train_true[l] += list(y[:, i].cpu().numpy())
                     y_train_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                loss_weight = [1, 1, 1, 10, 10, 10]
-                loss = sum(
-                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
-                reg_loss = self.get_regularization_loss()
-                curr_loss = loss + reg_loss
-                self.writer.add_scalar("train_loss", curr_loss.detach().mean(), idx)
+                    # self.writer.add_scalar("user_"+l+'_batch_avg', user_avg_weight_in_batch[i], idx)
                 optimizer.zero_grad()
                 curr_loss.backward()
                 optimizer.step()
                 total_loss += float(curr_loss)
-                count += 1
+                count_train += batch_size
             auc = dict()
             for l in self.labels:
                 auc[l] = roc_auc_score(y_train_true[l], y_train_predict[l])
-                print("Epoch %d train loss is %.3f, %s auc is %.3f" % (e + 1, total_loss / count, l, auc[l]))
+                print("Epoch %d train loss is %.3f, %s auc is %.3f" % (e + 1, total_loss / count_train, l, auc[l]))
             # 验证
             total_eval_loss = 0
             model.eval()
             count_eval = 0
             y_val_true = collections.defaultdict(list)
             y_val_predict = collections.defaultdict(list)
-            save_message = []
             for idx, (x, y) in enumerate(val_loader):
                 x, y = x.to(device), y.to(device)
-                predict = model(x)
+                batch_size = x.shape[0]
+                # predict, user_weight, item_weight = model(x)
+                predict, u_weight = model(x)
+                user_weight = u_weight.detach()
                 for i, l in enumerate(self.labels):
                     y_val_true[l] += list(y[:,i].cpu().numpy())
-                    y_val_predict[l] += list(predict[:, i].cpu().detach().numpy())
-                val_x = x.cpu().numpy()
-                val_x[:, 0] = le['user_id'].inverse_transform(val_x[:, 0].astype(int))
-                val_x[:, 27] = le['video_id'].inverse_transform(val_x[:, 27].astype(int))
-                save_message.append(np.concatenate([val_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
-                loss_weight = [1, 1, 1, 1, 1, 10]
-                loss = sum(
-                    [self.loss_function[i](predict[:, i], y[:, i], reduction='sum')*loss_weight[i] for i in range(self.num_tasks)])
+                    y_val_predict[l] += list(predict[:, i].cpu().detach().numpy())# loss计算
+                main_loss = sum(
+                    [torch.matmul(user_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none'))*loss_weight_easy[i] for i in range(self.num_tasks)])
                 reg_loss = self.get_regularization_loss()
-                curr_loss = loss + reg_loss
+                aux_loss = sum(
+                    [self.loss_function[i](u_weight[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
+                curr_loss = main_loss + aux_loss + reg_loss
                 self.writer.add_scalar("val_loss", curr_loss.detach().mean(), idx)
                 total_eval_loss += float(curr_loss)
-                count_eval += 1
-            final_save_message = np.concatenate(save_message, axis=0)
-            val_df = pd.DataFrame(final_save_message)
-            # val_df.to_csv(save_data_path+'val_predict_data.csv', index=False)
+                count_eval += batch_size
             auc = dict()
             for l in self.labels:
                 auc[l] = roc_auc_score(y_val_true[l], y_val_predict[l])
@@ -362,30 +353,38 @@ class PLE(nn.Module):
         count_test = 0
         y_test_true = collections.defaultdict(list)
         y_test_predict = collections.defaultdict(list)
+        save_message = []
         for idx, (x, y) in enumerate(test_loader):
             x, y = x.to(device), y.to(device)
-            predict = model(x)
+            batch_size = x.shape[0]
+            # predict, user_weight, item_weight = model(x)
+            predict, u_weight = model(x)
+            user_weight = u_weight.detach()
             for i, l in enumerate(self.labels):
                 y_test_true[l] += list(y[:, i].cpu().numpy())
-                y_test_predict[l] += list(predict[:, i].cpu().detach().numpy())
+                y_test_predict[l] += list(predict[:, i].cpu().detach().numpy())# user_id转换
             test_x = x.cpu().numpy()
             test_x[:, 0] = le['user_id'].inverse_transform(test_x[:, 0].astype(int))
-            # test_x[:, 27] = le['video_id'].inverse_transform(test_x[:, 27].astype(int))
-            save_message.append(np.concatenate([test_x, y.cpu().numpy(), predict.cpu().detach().numpy()], axis=1))
-            loss = sum(
-                [self.loss_function[i](predict[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
+            test_x[:, 27] = le['video_id'].inverse_transform(test_x[:, 27].astype(int))
+            save_message.append(np.concatenate([test_x, y.cpu().numpy(), predict.cpu().detach().numpy(), user_weight.detach().numpy()], axis=1))
+            # loss计算
+            main_loss = sum(
+                [torch.matmul(user_weight[:, i].T, self.loss_function[i](predict[:, i], y[:, i], reduction='none')) *
+                 loss_weight_easy[i] for i in range(self.num_tasks)])
             reg_loss = self.get_regularization_loss()
-            curr_loss = loss + reg_loss
-            self.writer.add_scalar("test_loss", curr_loss.detach().mean(), idx)
+            aux_loss = sum(
+                [self.loss_function[i](u_weight[:, i], y[:, i], reduction='sum') for i in range(self.num_tasks)])
+            curr_loss = main_loss + aux_loss + reg_loss
+            self.writer.add_scalar("test_loss", curr_loss.detach().mean()/batch_size, idx)
             total_test_loss += float(curr_loss)
-            count_test += 1
+            count_test += batch_size
         final_save_message = np.concatenate(save_message, axis=0)
         test_df = pd.DataFrame(final_save_message)
-        test_df.to_csv(save_data_path+'test_predict_data_ple.csv', index=False)
+        test_df.to_csv(save_data_path + 'test_predict_data_mmoeweight.csv', index=False)
         auc = dict()
         for l in self.labels:
             auc[l] = roc_auc_score(y_test_true[l], y_test_predict[l])
-            print("test loss is %.3f, %s auc is %.3f" % (total_test_loss / count_test, l, auc[l]))
+            print("Epoch %d test loss is %.3f, %s auc is %.3f" % (e + 1, total_test_loss / count_test, l, auc[l]))
 
     def get_regularization_loss(self, ):
         total_reg_loss = torch.zeros((1,), device=self.device)
